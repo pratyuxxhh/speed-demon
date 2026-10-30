@@ -7,7 +7,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 0 | The reference, unchanged | | 32.05 | 228 | 0 |
 | 1 | C rewrite: 2-pass threaded scan, flat group array, quickselect | _not pushed yet_ | | | |
 | 2 | Memory cuts: small buffers, in-place percentiles, no per-thread error arrays, affinity-based thread count | _not pushed yet_ | | | |
-| 3 | -O3 -march=x86-64-v3, AVX2 endpoint scan, word hash, method length from 2 letters, bands removed | _not pushed yet_ | | | |
+| 3 | -O3 -march=x86-64-v3, AVX2 endpoint scan, word hash, method length from 2 letters, bands removed (commit `d8af656`) | _fill in from the board_ | | | |
+| 4 | One parse pass into per-hour buckets, shared lock-free endpoint table, per-hour parallel finish with an ordered writer, mmap, 1 MB chunks from a counter | _not pushed yet_ | | | |
 
 The board columns are filled from board runs only. Until a push is measured, the local numbers below are what we have.
 
@@ -49,8 +50,62 @@ That is 116x by the monotonic clock. The machine was busier during this second s
 | 2, sd-timer | 4990/43 = 116 → 10.77 | 67.8/13.4 = 5.06 → 1.38 | 324 → 0.769 | 1 → 1 | 11.5 | 53 |
 | 2, session 3 (A/B) | 4210/35 = 120 → 10.97 | 67.9/13.5 = 5.02 → 1.38 | 324 → 0.769 | 1 → 1 | 11.7 | 53 |
 | 3, session 3 (A/B) | 4210/32 = 132 → 11.47 | 67.9/13.3 = 5.11 → 1.39 | 318 → 0.771 | 1 → 1 | 12.3 | 54 |
+| 3, session 4 (A/B) | 3831/32 = 120 → 10.94 | 67.9/13.4 = 5.06 → 1.38 | 318 → 0.771 | 1 → 1 | 11.7 | 53 |
+| 4, session 4 (A/B, 11 runs) | 3831/29 = 132 → 11.49 | 67.9/16.2 = 4.20 → 1.33 | 283 → 0.784 | 1 → 1 | 12.0 | 54 |
+| 4, session 4 (2 × 15 runs) | 3831/25 = 153 → 12.38 | 67.9/16.2 = 4.20 → 1.33 | 283 → 0.784 | 1 → 1 | 12.9 | 56 |
 
 Step 1 was measured unpinned (16 CPUs) and step 2 pinned to 12 CPUs. Unpinned, step 2 is 37 ms and 14.1 MB, which is still better than step 1 on both.
+
+## Step 4: one pass, no merge, per-hour parallel finish
+
+- **Problem identified (step 3):**
+  - Pass 2 re-read and re-parsed every line, including the endpoint hash and lookup, only to learn where each latency belonged.
+  - The merge of per-thread endpoint tables and the output were serial: at 12 CPUs on sample, about 12–15 ms of a 32 ms run.
+  - Twelve equal byte ranges assume equally fast cores, which a hybrid P/E-core CPU or a busy host breaks.
+- **Optimization:**
+  1. **One pass over the text.** Each line appends its latency (u32) and a tag (endpoint id in 12 bits, plus a 5xx bit, u16) to the parsing thread's bucket for its hour. That is 6 bytes per line: about 18.6 MB at full scale, against step 3's 12.4 MB latency array plus per-thread count tables. Latencies are full u32 per the spec (0 to 4294967295), so they cannot be packed into fewer bits.
+  2. **One shared endpoint table**, lock-free like track C's: claim a slot by compare-and-swap, store the bytes, publish `hash | id`. After the first lines every lookup is a read. There are no per-thread tables to merge; the 1,842 endpoints are ranked once at the end with `qsort`.
+  3. **Per-hour finish, in parallel.** A thread takes an hour from a counter, counts that hour's records by endpoint across every thread's bucket, scatters the latencies into a per-thread array grouped by endpoint, quickselects p99, p95, p50, and formats the hour's lines into a buffer.
+  4. **Ordered output without waiting.** A finished hour's buffer is handed over. Whoever holds the writer lock (taken with `trylock`) writes every finished hour from the next unwritten one on, then checks again after unlocking. `main` flushes once more after the threads join, so a handover that raced the unlock is still written in order. Written buffers are recycled through a small spare list.
+  5. **`mmap` instead of `pread`**, over a zeroed region one page longer, so the AVX2 space search and the word hash can read a few bytes past the last line safely. The harness pre-warms the dataset into the page cache with `vmtouch` before timing, so the mapped pages are not charged to the container. The local peaks below agree: step 4 at 1 CPU is 8.8 MB against step 3's 9.8 MB.
+  6. **Chunked load balancing:** 1 MB line-aligned chunks taken from an atomic counter, and never more threads than chunks.
+- **Not done:**
+  - **Hour-by-hour streaming with a reorder buffer.** The spec says "no bound on how far a line can be out of order is promised: a solution must not rely on one", and shard 0 uploads each hour 5 to 10 minutes after it ends. The per-hour buckets above give the same per-hour parallelism without relying on order.
+  - **A 14-bit latency field:** latencies span the full u32 range.
+- **Tried on the way:**
+
+  | Variant | Hour phase at 12 CPUs | Kept? |
+  |---|---|---|
+  | ticket order, waiting threads spinning on `sched_yield` | 13–21 ms (4 CPUs: 7.5 ms) | no: the spinners took CPU from the workers on this 4-P-core machine |
+  | ticket order, waiting on a condition variable | 22–65 ms | no: a chain of 72 sleep/wake handoffs, each costing up to about 1 ms in this VM |
+  | writer-combining handover (the design above) | 7–12 ms | yes |
+  | raising glibc's mmap threshold, so 140 KB hour buffers stay in the heap | | no |
+  | recycling hour buffers through a spare list instead | | yes |
+
+  Same session, 15 runs × 2 rounds, glibc threshold vs recycling:
+
+  | | 8 CPUs | 12 CPUs | peak |
+  |---|---|---|---|
+  | glibc threshold | 22 ms | 21 ms | 0.5–0.8 MB higher |
+  | recycling | 22–23 ms | 24–26 ms | |
+
+  Recycling is kept because the glibc setting changes every allocation, including the growing per-hour buckets, whose memory at full scale could suffer more than the sample shows.
+- **Result (A/B against step 3, same session, 11 runs each, medians):**
+
+  | CPUs | step 3 | step 4 |
+  |---|---|---|
+  | 1 | 62 ms, 9.8 MB | 41 ms, 8.8 MB |
+  | 8 | 32 ms, 12.1 MB | 23 ms, 14.8 MB |
+  | 12 | 32 ms, 13.4 MB | 29 ms, 16.2 MB (24–26 ms in the 15-run rounds) |
+
+  Code fell from 318 to 283 lines. Peak memory rose at 8 and 12 CPUs. On sample the buckets are only 1.9 MB, so most of the rise is per-thread buckets and malloc arenas, plus the 5 MB output file, whose page cache is charged to the writing container in every variant.
+- **Correctness:** everything below ran with the ASan/UBSan build with `-Wall -Wextra`, and the chunk splitting is exercised at every boundary:
+  - the worked example, byte for byte;
+  - an empty input, giving an empty output;
+  - the sample sha256 on 1 and 12 CPUs;
+  - tiny seeds 1–3 and sample seeds 2–3 against the reference on 1 and 12 CPUs.
+
+  All match.
 
 ## Step 3: compiler flags, faster parsing, no dead code
 
