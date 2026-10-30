@@ -7,6 +7,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 0 | The reference, unchanged | | 32.05 | 228 | 0 |
 | 1 | C rewrite: 2-pass threaded scan, flat group array, quickselect | _not pushed yet_ | | | |
 | 2 | Memory cuts: small buffers, in-place percentiles, no per-thread error arrays, affinity-based thread count | _not pushed yet_ | | | |
+| 3 | -O3 -march=x86-64-v3, AVX2 endpoint scan, word hash, method length from 2 letters, bands removed | _not pushed yet_ | | | |
 
 The board columns are filled from board runs only. Until a push is measured, the local numbers below are what we have.
 
@@ -46,8 +47,55 @@ That is 116x by the monotonic clock. The machine was busier during this second s
 | 1 | 3780/42 = 90.0 → 9.49 | 67.8/22.2 = 3.06 → 1.25 | 296 → 0.779 | 1 → 1 | 9.2 | 48 |
 | 2 | 3671/29 = 126.6 → 11.25 | 67.8/13.4 = 5.08 → 1.38 | 324 → 0.769 | 1 → 1 | 12.0 | 54 |
 | 2, sd-timer | 4990/43 = 116 → 10.77 | 67.8/13.4 = 5.06 → 1.38 | 324 → 0.769 | 1 → 1 | 11.5 | 53 |
+| 2, session 3 (A/B) | 4210/35 = 120 → 10.97 | 67.9/13.5 = 5.02 → 1.38 | 324 → 0.769 | 1 → 1 | 11.7 | 53 |
+| 3, session 3 (A/B) | 4210/32 = 132 → 11.47 | 67.9/13.3 = 5.11 → 1.39 | 318 → 0.771 | 1 → 1 | 12.3 | 54 |
 
 Step 1 was measured unpinned (16 CPUs) and step 2 pinned to 12 CPUs. Unpinned, step 2 is 37 ms and 14.1 MB, which is still better than step 1 on both.
+
+## Step 3: compiler flags, faster parsing, no dead code
+
+- **Problem identified.** Phase timers in a throwaway copy of step 2 (sample):
+
+  | Phase | 1 CPU | 12 CPUs |
+  |---|---|---|
+  | pass 1 | 39–63 ms | 12.5 ms |
+  | merge | 1.4–2 ms | 2–5 ms (serial) |
+  | pass 2 | 23–29 ms | 8.5–9.8 ms |
+  | percentiles | 7–12 ms | 2–3 ms |
+  | output | 8–14 ms | 9–10 ms (serial) |
+
+  Step 2 was built with `-O2` and no CPU target, while tracks B–D use `-O3 -march=x86-64-v3`. Parsing went byte by byte: the method was skipped with a loop, the endpoint was scanned and hashed with FNV-1a at one multiply per byte, and the latency digits were read in a loop.
+- **Optimization:**
+  1. `-O3 -march=x86-64-v3` (AVX2; a fixed target, not `-march=native`).
+  2. The method's length comes from its first two letters (G/H/D/O; P+U, P+O, P+A). The spec lists exactly seven methods.
+  3. The endpoint's end is found by an AVX2 compare for the space, 32 bytes at a time. Read buffers have 64 bytes of slack.
+  4. The endpoint hash mixes 8-byte words instead of single bytes.
+  5. The unused hour-bands code (`-DBANDS`, default 1) is removed: 6 fewer counted lines.
+- **Tried and not adopted: parallel output.** Line lengths were summed per hour during the percentile step, and each thread formatted whole hours and `pwrite`d them at their offsets. Five runs each at 12 CPUs, output phase only:
+
+  | Variant | Output phase |
+  |---|---|
+  | 12 writers | 13–23 ms |
+  | 12 writers, file pre-sized with `ftruncate` | 10–25 ms |
+  | one writer | 9–12 ms |
+
+  The kernel serializes writes to one file, so the threads mostly waited, and the code went back to one sequential writer.
+- **Result:** in phase timers, pass 1 on 1 CPU fell from 39–63 ms to about 20 ms. End to end, A/B against step 2 in the same session (9 runs each, medians):
+
+  | CPUs | step 2 | step 3 |
+  |---|---|---|
+  | 1 | 66 ms | 60 ms |
+  | 8 | 40 ms | 32 ms |
+  | 12 | 35 ms | 32 ms |
+
+  Peak memory is unchanged, about 13.3 MB. The reference took 4210 ms in this session.
+- **Correctness:** everything below ran with a `-fsanitize=address,undefined` build with `-Wall -Wextra`:
+  - the worked example, byte for byte;
+  - an empty input, giving an empty output;
+  - the sample sha256 on 1 and 12 CPUs;
+  - tiny seeds 1–3 and sample seeds 2–3, generated with the organisers' generator, against the unchanged reference on 1 and 12 CPUs.
+
+  All match.
 
 ## Step 2: memory reduction
 
