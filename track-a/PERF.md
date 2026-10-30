@@ -28,6 +28,15 @@ Machine: WSL2 Ubuntu on Windows 11, 16 hardware threads, 6 GB RAM, Docker 29.1.3
 
 The 12-CPU rows are the closest local match to the board (6 P-cores, 12 threads). The reference's 12255 ms run was an outlier on this machine, and the median ignores it.
 
+**Timing correction.** The "inside" numbers above came from `date +%s%N`, which reads the wall clock. Under WSL2 that clock jumps: later runs printed negative times, and the reference's 12255 ms outlier was most likely one of those jumps. All later local timings use the organisers' `harness/timer/sd-timer.c` (CLOCK_MONOTONIC, exec to exit), built statically with the allowlisted gcc:15 image and run as the container's entry, as on the board. Re-measured that way, step 2 at `--cpuset-cpus=0-11`, 5 runs each:
+
+| | inside runs (ms) | median | peak (KiB) |
+|---|---|---|---|
+| reference | 5110, 4945, 4919, 5283, 4990 | 4990 | 67732–67968 |
+| step 2 | 43, 55, 47, 37, 34 | 43 | 13220–13572 |
+
+That is 116x by the monotonic clock. The machine was busier during this second session, and both programs slowed together.
+
 ### Local K estimate (sample, 12 CPUs, not the board's number)
 
 `K = (T_ref/T)^0.5 × min(M_ref/M, 50)^0.2 × min(S_ref/S, 1)^0.15 × (D_ref/D)^0.15`, with S counted as non-blank, non-comment lines (the board counts after clang-format, so it may differ slightly):
@@ -36,6 +45,7 @@ The 12-CPU rows are the closest local match to the board (6 P-cores, 12 threads)
 |---|---|---|---|---|---|---|
 | 1 | 3780/42 = 90.0 → 9.49 | 67.8/22.2 = 3.06 → 1.25 | 296 → 0.779 | 1 → 1 | 9.2 | 48 |
 | 2 | 3671/29 = 126.6 → 11.25 | 67.8/13.4 = 5.08 → 1.38 | 324 → 0.769 | 1 → 1 | 12.0 | 54 |
+| 2, sd-timer | 4990/43 = 116 → 10.77 | 67.8/13.4 = 5.06 → 1.38 | 324 → 0.769 | 1 → 1 | 11.5 | 53 |
 
 Step 1 was measured unpinned (16 CPUs) and step 2 pinned to 12 CPUs. Unpinned, step 2 is 37 ms and 14.1 MB, which is still better than step 1 on both.
 
