@@ -7,7 +7,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 0 | The reference, unchanged | | 14.44 | 367 | 0 |
 | 1 | C rewrite: quote-parity split, hand-written CSV parser, array join, shared name table + per-group bitsets | _not pushed yet_ | | | |
 | 2 | Memory pass: 64 KB buffers, 1-byte region map, packed name slots, one shared name arena | _not pushed yet_ | | | |
-| 3 | No quote pass (spec 2.2 boundary rule); 64-byte name records holding their groups' bits | _not pushed yet_ | | | |
+| 3 | No quote pass (spec 2.2 boundary rule); 64-byte name records holding their groups' bits (commit `a3eb9fc`) | _fill in from the board_ | | | |
+| 4 | AVX2 bitmask CSV parser, mmap + 1 MB chunks from a counter, tag + record name table, batched prefetch, parallel regions.csv | _not pushed yet_ | | | |
 
 The board columns are filled from board runs only. Until a push is measured, the local numbers below are what we have.
 
@@ -167,3 +168,65 @@ Peak memory at 12 CPUs went from 12.0 to 13.1 MB: 64 bytes per name instead of t
 - the forced name-table regrowth (starting at 1,024 slots) on 1 and 12 CPUs.
 
 All match.
+
+## Full-scale measurements (seed 1, generated locally)
+
+The full dataset was generated with the organisers' generator (`--seed 1 --scale full`), which is the board's dataset. `records.csv` sha256 `36166f4a…` and `regions.csv` `414c57c4…` match the spec, and every row below matched the published expected `aggregates.txt` sha256 `d8088b1cd42ba1338b1345b107b55db7b96ef1f5066f3ff64fd26a8912a0f536`. The reference ran once at full: **31,188 ms, 365 MB peak** (the board's calibration is 14.44 s, so this machine is about 2.2x slower than the scoring box).
+
+| Session | Step | CPUs | runs | inside median (min–max), ms | peak median (KiB) |
+|---|---|---|---|---|---|
+| A | 3 | 1 | 1 | 1820 | 13048 |
+| A | 3 | 0-11 | 7 | 209 (178–312) | 13408 |
+| B (final A/B) | 3 | 1 | 3 | 1179 (952–1513) | 10480 |
+| B | 4 | 1 | 3 | 646 (552–731) | 10708 |
+| B | 3 | 0-11 | 9 | 166 (145–190) | 13476 |
+| B | 4 | 0-11 | 9 | 121 (110–130) | 13404 |
+
+Sample, session B:
+
+| Step | CPUs | ms | peak (KiB) |
+|---|---|---|---|
+| 3 | 1 | 138 | 10036 |
+| 4 | 1 | 85 | 10748 |
+| 3 | 0-11 | 51 | 13000 |
+| 4 | 0-11 | 37 | 12884 |
+
+The reference: 2939 ms and 70164 KiB at 0-11.
+
+### Local K estimates
+
+| Data | Step | T ratio | M ratio | S | K | points |
+|---|---|---|---|---|---|---|
+| full (A) | 3 | 31188/209 = 149 → 12.22 | 365.1/13.4 = 27.2 → 1.94 | 353 → 0.837 | 19.8 | 65 |
+| full (B) | 3 | 31188/166 = 188 → 13.71 | 365.1/13.5 = 27.1 → 1.94 | 353 → 0.837 | 22.2 | 67 |
+| full (B) | 4 | 31188/121 = 258 → 16.05 | 365.1/13.4 = 27.2 → 1.94 | 372 → 0.831 | 25.8 | 71 |
+| sample (B) | 3 | 2939/51 = 57.6 → 7.59 | 70.2/13.0 = 5.40 → 1.40 | 353 → 0.837 | 8.9 | 47 |
+| sample (B) | 4 | 2939/37 = 79.4 → 8.91 | 70.2/12.9 = 5.45 → 1.40 | 372 → 0.831 | 10.4 | 51 |
+
+## Step 4: SIMD parser, chunks, batched lookups
+
+- **Problem identified (step 3).** At 1 CPU on sample:
+
+  | Variant | Time |
+  |---|---|
+  | CSV parsing only | 49 ms |
+  | full step 3 | 89–193 ms |
+
+  The scalar parser found field ends with `memchr` and byte loops. Each record then made dependent cache misses: the hash slot, then the 64-byte name record, then its group bit. Twelve fixed ranges let late-starting threads hold up the end.
+- **Optimization:**
+  1. **AVX2 bitmask parsing.** For each 64-byte block:
+     - masks of `"`, `,` and LF;
+     - inside-quotes = prefix XOR of the quote bits, carried from block to block;
+     - field ends = commas and LFs outside quotes, walked with `ctz`.
+
+     A `""` escape flips the state twice, so it needs no special case. A chunk starts at a record boundary, so the state starts outside. A quoted field of raw length L with Q quote bytes, counted by popcount, has L − 1 − Q/2 value bytes, so notes are never scanned again. A CR before an LF is dropped from the amount, and a BOM is checked only at a record start.
+  2. **`mmap` and 1 MB chunks from an atomic counter.** By the spec 2.2 rule (an LF followed by a digit or a BOM starts a record), a chunk's first record is found from any offset. The file is mapped over a zeroed region one page longer, so the 64-byte loads past the end see zeros. This removes the read buffers and the "incomplete record, read more" logic.
+  3. **Name table: 1-byte tags plus 64-byte records in slot order.** A record holds the name's first 24 bytes and its 32-bit length (compared in one 32-byte AVX2 compare), an arena offset for longer names, and the 256-bit group set. That is 2^17 slots (8 MB of records, 128 KB of tags). It is regrown and the pass redone if more than 7/8 full; a forced regrowth was tested in step 3.
+  4. **Batched prefetch.** Each parsed record is queued with its name hash; its tag, record line and region-map byte are prefetched, and every 32 records the batch is applied. A name with `""` escapes is unescaped and applied at once. The group bit is read with a plain load before `lock or`.
+  5. **`regions.csv` in parallel.** Every thread parses a line-aligned slice into the shared map. A country's group is claimed by swapping 0 for BUSY in its 3-letter code's slot, so there are no holes in the numbering.
+- **Tried and not adopted:**
+  - **Huge pages for the name records** (`MADV_HUGEPAGE`; THP is in `madvise` mode here). Full scale, same session: 12 CPUs 126 ms against 142 ms without, but peak 19.2 MB against 13.4 MB. In K that is about √(142/126) × (13.4/19.2)^0.2 ≈ 0.99, a small loss, so it is off.
+  - **Not done: a hash as the name's identity.** The spec compares names as exact byte strings, and a 64-bit collision, however unlikely, would change `names_distinct`. Names stay compared byte for byte.
+- **Correctness:**
+  - The whole step-3 suite passed again with the ASan/UBSan build: the worked example, the sample on 1 and 12 CPUs, tiny seeds 1–5 and sample seeds 2–3 against the reference on 1 and 12 CPUs, and the unterminated last record. The full dataset's published sha256 also matches, with the optimised build.
+  - **Differential fuzzing against the unchanged reference.** A generator of hostile files following spec 2.1/2.2 produced 60 files: 551 mid-file BOMs, 5,704 CRLF endings, about 17,000 `""` escapes, 5,040 LFs inside notes, and 15 files without a final terminator. Each ran with `CHUNK` set to 64 bytes, 4 KB and 1 MB, on 1 and 12 CPUs: 360 runs, 0 mismatches. The final code ran another 20 files the same way: 0 mismatches.

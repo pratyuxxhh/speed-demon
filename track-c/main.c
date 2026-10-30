@@ -1,61 +1,93 @@
 // Speed Demon 2026, Track C (Join): parse a hostile records.csv, join each record
 // to regions.csv on region_id, and aggregate per country. See specs/c-join.md.
 //
-// Parallel parsing despite LFs inside quotes: spec section 2.2 guarantees that a
-// note's LF is followed by a lowercase word and that names hold no LF, so an LF
-// followed by a digit or a BOM is always a record boundary. Each thread parses
-// whole records from such a boundary. Distinct names use one shared, lock-free
-// name table; each distinct name owns a 64-byte record holding its first 24
-// bytes and the set of groups it occurs in, so a lookup and its group bit touch
-// one cache line. Notes are only measured, never copied.
+// records.csv is mapped and cut into 1 MB chunks that threads take from a
+// counter. Spec section 2.2 guarantees that a note's LF is followed by a
+// lowercase word and that names hold no LF, so an LF followed by a digit or a
+// BOM is a record boundary, found from any offset. A chunk is parsed 64 bytes at
+// a time with AVX2 masks: a prefix XOR of the quote bits says which bytes are
+// inside quotes (a "" escape flips twice), and the commas and LFs outside
+// quotes are the field ends. Records are parsed in batches whose name-table and
+// region-map lines are prefetched, then applied. Distinct names use a table of
+// 1-byte tags and 64-byte records (the name's first 24 bytes, its length, the
+// set of groups it occurs in), compared byte for byte.
 #define _GNU_SOURCE
 #include <fcntl.h>
+#include <immintrin.h>
 #include <pthread.h>
 #include <sched.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
-#define BUFSZ (1 << 16) // read buffer per thread; a record is far smaller
-#define MAPN 10000000   // region ids at or above this are unmatched
-#define MAXG 256        // groups: _UNMATCHED (0) plus the countries (240 in the spec)
-#define IDBITS 24       // name ids per table slot; the table never exceeds 2^24 slots
-#define IDMASK ((1u << IDBITS) - 1)
-#define INL 24 // name bytes kept in the record; longer names keep the rest in the arena
+#ifndef CHUNK
+#define CHUNK (1 << 20)
+#endif
+#define MAPN 10000000 // region ids at or above this are unmatched
+#define MAXG 256      // groups: _UNMATCHED (0) plus the countries (240 in the spec)
+#define INL 24        // name bytes kept in the record; longer names keep the rest in the arena
+#define BATCH 32
+#define BUSY 0xFFFF
 
 typedef struct {
   uint64_t count, id_sum, name_bytes, note_bytes;
   int64_t sum, min, max;
 } Agg;
 typedef struct {
-  uint32_t len, off;      // off: where arena holds the bytes past INL
-  uint64_t inl[INL / 8];  // the first INL bytes, zero padded
-  uint64_t groups[4];     // the groups this name occurs in
-} Name;                   // 64 bytes, one cache line
+  uint8_t name[INL]; // zero padded
+  uint32_t len, off; // off: where arena holds the bytes past INL
+  uint64_t groups[4];
+} Rec; // 64 bytes, one cache line
 typedef struct {
-  long beg, end;
-  char *buf, *tmp;
-  uint64_t distinct[MAXG];
+  const char *name;
+  uint64_t h, id;
+  uint32_t len, xlen, rid;
+  int64_t cents;
+} Pend;
+typedef struct {
+  long beg, end; // this thread's slice of regions.csv
   Agg agg[MAXG];
+  uint64_t distinct[MAXG];
+  Pend pend[BATCH];
+  int np;
+  char *tmp;
 } Th;
 
-static int fd, nth, ngroups, overflow;
+static const char *data, *rdata;
+static long size, rsize, body, next_chunk, nchunks;
+static int nth, ngroups = 1, overflow;
 static Th *th;
 static uint8_t *region; // region id -> group, 0 = _UNMATCHED
-static char codes[MAXG][12]; // "XYZ" or "_UNMATCHED"
-// Name table slot: 0 empty, 1 being written, else hash bits above IDBITS | id.
-static uint64_t *slots;
+static uint16_t by_code[26 * 26 * 26]; // country code -> group; 0 unseen, BUSY being assigned
+static char codes[MAXG][12] = {"_UNMATCHED"};
+static uint8_t *tags; // 0 empty, 1 being written, else 0x80 | 7 hash bits
+static Rec *recs;
 static uint32_t cap, nnames;
-static Name *names;
 static char *arena; // name bytes past INL; at most the size of records.csv
 static uint64_t arena_used;
 
 static void die(const char *m) {
   fprintf(stderr, "%s\n", m);
   exit(1);
+}
+
+// Map a file over a zeroed region one page longer, so that 64-byte loads a little
+// past its end stay inside mapped memory and see only zeros.
+static const char *map_file(const char *path, long *len) {
+  struct stat st;
+  int f = open(path, O_RDONLY);
+  if (f < 0 || fstat(f, &st))
+    die("cannot open input");
+  *len = st.st_size;
+  char *m = mmap(NULL, *len + 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (m == MAP_FAILED || (*len && mmap(m, *len, PROT_READ, MAP_PRIVATE | MAP_FIXED, f, 0) == MAP_FAILED))
+    die("mmap failed");
+  close(f);
+  return m;
 }
 
 static uint64_t hash_bytes(const char *s, uint32_t n) { // reads up to 7 bytes past s + n
@@ -67,173 +99,226 @@ static uint64_t hash_bytes(const char *s, uint32_t n) { // reads up to 7 bytes p
     h = (h ^ w) * 0xFF51AFD7ED558CCDull;
     h ^= h >> 32;
   }
-  return h | 1ull << 63; // never 0 (empty) or 1 (being written)
+  return h;
 }
 
-// The id of name s[0..n) in the shared table, inserted when new. An inserter
-// claims an empty slot by swapping 0 for 1, fills the record, then publishes
-// hash | id.
-static uint32_t name_id(const char *s, uint32_t n) {
-  uint64_t h = hash_bytes(s, n), key = h & ~(uint64_t)IDMASK, w[INL / 8] = {0};
-  memcpy(w, s, n < INL ? n : INL);
+// The record of name s[0..n), inserted when new: an inserter claims an empty tag
+// by swapping 0 for 1, fills the record, then publishes the tag.
+static Rec *name_rec(const char *s, uint32_t n, uint64_t h) {
+  uint8_t tag = 0x80 | h >> 57;
+  Rec key = {{0}, n, 0, {0}};
+  memcpy(key.name, s, n < INL ? n : INL);
+  __m256i k = _mm256_loadu_si256((const __m256i *)&key);
   for (uint32_t i = h & (cap - 1);; i = (i + 1) & (cap - 1)) {
-    uint64_t v = __atomic_load_n(&slots[i], __ATOMIC_ACQUIRE);
+    uint8_t v = __atomic_load_n(&tags[i], __ATOMIC_ACQUIRE);
     if (v == 0) {
-      if (__atomic_load_n(&nnames, __ATOMIC_RELAXED) >= cap / 4 * 3) {
+      if (__atomic_load_n(&nnames, __ATOMIC_RELAXED) >= cap / 8 * 7) {
         overflow = 1; // too many names for this table: the pass is redone, larger
-        return 0;
+        return recs;
       }
-      if (__atomic_compare_exchange_n(&slots[i], &v, 1, 0, __ATOMIC_ACQUIRE, __ATOMIC_ACQUIRE)) {
-        uint32_t id = __atomic_fetch_add(&nnames, 1, __ATOMIC_RELAXED);
-        Name *e = &names[id];
-        *e = (Name){n, 0, {w[0], w[1], w[2]}, {0}};
+      if (__atomic_compare_exchange_n(&tags[i], &v, 1, 0, __ATOMIC_ACQUIRE, __ATOMIC_ACQUIRE)) {
         if (n > INL) {
-          e->off = __atomic_fetch_add(&arena_used, n - INL, __ATOMIC_RELAXED);
-          memcpy(arena + e->off, s + INL, n - INL);
+          key.off = __atomic_fetch_add(&arena_used, n - INL, __ATOMIC_RELAXED);
+          memcpy(arena + key.off, s + INL, n - INL);
         }
-        __atomic_store_n(&slots[i], key | id, __ATOMIC_RELEASE);
-        return id;
+        recs[i] = key;
+        __atomic_fetch_add(&nnames, 1, __ATOMIC_RELAXED);
+        __atomic_store_n(&tags[i], tag, __ATOMIC_RELEASE);
+        return &recs[i];
       }
     }
     while (v == 1) // another thread is filling this slot
-      v = __atomic_load_n(&slots[i], __ATOMIC_ACQUIRE);
-    if ((v & ~(uint64_t)IDMASK) == key) {
-      Name *e = &names[v & IDMASK];
-      if (e->len == n && e->inl[0] == w[0] && e->inl[1] == w[1] && e->inl[2] == w[2] &&
-          (n <= INL || memcmp(arena + e->off, s + INL, n - INL) == 0))
-        return v & IDMASK;
+      v = __atomic_load_n(&tags[i], __ATOMIC_ACQUIRE);
+    if (v == tag) { // compare the name's first 24 bytes and its length at once
+      __m256i r = _mm256_loadu_si256((const __m256i *)&recs[i]);
+      uint32_t eq = _mm256_movemask_epi8(_mm256_cmpeq_epi8(r, k));
+      if ((eq & 0x0FFFFFFF) == 0x0FFFFFFF &&
+          (n <= INL || memcmp(arena + recs[i].off, s + INL, n - INL) == 0))
+        return &recs[i];
     }
   }
 }
 
-// One text field at *pp: its value's start (raw, still escaped) and length after
-// unescaping, plus the number of "" pairs; *pp moves to the byte after the field.
-// 0 when the field runs past end.
-static int field(const char **pp, const char *end, const char **s, uint32_t *len, uint32_t *esc) {
-  const char *p = *pp;
-  *esc = 0;
-  if (p < end && *p == '"') {
-    const char *b = ++p;
-    for (;;) {
-      const char *q = memchr(p, '"', end - p);
-      if (!q || q + 1 >= end)
-        return 0;
-      if (q[1] != '"') {
-        *s = b;
-        *len = q - b - *esc;
-        *pp = q + 1;
-        return 1;
-      }
-      ++*esc;
-      p = q + 2;
-    }
-  }
-  const char *q = p;
-  while (q < end && *q != ',' && *q != '\r' && *q != '\n')
-    q++;
-  if (q >= end)
-    return 0;
-  *s = p;
-  *len = q - p;
-  *pp = q;
-  return 1;
+static void apply(Th *t, const Pend *p) {
+  uint32_t g = p->rid < MAPN ? region[p->rid] : 0;
+  Agg *a = &t->agg[g];
+  a->count++;
+  a->id_sum += p->id;
+  a->sum += p->cents;
+  a->min = p->cents < a->min ? p->cents : a->min;
+  a->max = p->cents > a->max ? p->cents : a->max;
+  a->name_bytes += p->len;
+  a->note_bytes += p->xlen;
+  uint64_t *w = &name_rec(p->name, p->len, p->h)->groups[g / 64], bit = 1ull << (g % 64);
+  if (!(__atomic_load_n(w, __ATOMIC_RELAXED) & bit)) // a plain read first: lock or is a full barrier
+    __atomic_fetch_or(w, bit, __ATOMIC_RELAXED);
 }
 
-// Parse one record at p. Returns the byte after it, or NULL when it is not all
-// in [p, end) and more input follows (eof is 0).
-static const char *record(Th *t, const char *p, const char *end, int eof) {
-  if (end - p >= 3 && (uint8_t)p[0] == 0xEF && (uint8_t)p[1] == 0xBB && (uint8_t)p[2] == 0xBF)
-    p += 3; // a byte order mark at a record start is not data
-  uint64_t id = 0, rid = 0;
-  for (; p < end && *p != ','; p++)
-    id = id * 10 + (*p - '0');
-  const char *ns, *xs;
-  uint32_t nlen, xlen, nesc, xesc;
-  if (p >= end || (++p, !field(&p, end, &ns, &nlen, &nesc)) || p >= end || *p != ',')
-    return NULL;
-  if ((++p, !field(&p, end, &xs, &xlen, &xesc)) || p >= end || *p != ',')
-    return NULL;
-  for (p++; p < end && *p != ','; p++)
-    rid = rid * 10 + (*p - '0');
-  if (p >= end)
-    return NULL;
-  int neg = *++p == '-';
-  int64_t cents = 0;
-  for (p += neg; p < end && *p != '.'; p++)
-    cents = cents * 10 + (*p - '0');
-  if (end - p < 3 + !eof)
-    return NULL;
-  cents = cents * 100 + (p[1] - '0') * 10 + (p[2] - '0');
-  cents = neg ? -cents : cents;
-  p += 3;
-  if (p < end && *p == '\r')
-    p++;
-  if (p < end && *p == '\n')
-    p++;
-  else if (!eof)
-    return NULL;
+static void flush(Th *t) {
+  for (int i = 0; i < t->np; i++)
+    apply(t, &t->pend[i]);
+  t->np = 0;
+}
 
-  const char *name = ns;
-  if (nesc) { // unescape into tmp: "" -> "
+static uint64_t eq64(__m256i lo, __m256i hi, char c) {
+  __m256i v = _mm256_set1_epi8(c);
+  return (uint64_t)(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(hi, v)) << 32 |
+         (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(lo, v));
+}
+
+static uint64_t prefix_xor(uint64_t x) {
+  x ^= x << 1, x ^= x << 2, x ^= x << 4, x ^= x << 8, x ^= x << 16;
+  return x ^ x << 32;
+}
+
+static uint64_t digits(const char *s, const char *e) {
+  uint64_t v = 0;
+  for (; s < e; s++)
+    v = v * 10 + (*s - '0');
+  return v;
+}
+
+// One record from its five fields [f[i], fe[i]) and the quote counts of the
+// name and note; queue it, prefetching what applying it will touch.
+static void record(Th *t, const char **f, const char **fe, const uint64_t *fq) {
+  const char *s = f[0];
+  if ((uint8_t)s[0] == 0xEF && (uint8_t)s[1] == 0xBB && (uint8_t)s[2] == 0xBF)
+    s += 3; // a byte order mark at a record start is not data
+  Pend *p = &t->pend[t->np];
+  p->id = digits(s, fe[0]);
+  p->rid = (uint32_t)(fe[3] - f[3] > 8 ? MAPN : digits(f[3], fe[3]));
+  // A quoted field of raw length L holding Q quote bytes has L - 1 - Q/2 value bytes.
+  uint32_t nl = fe[1] - f[1], xl = fe[2] - f[2];
+  int nq = nl && *f[1] == '"';
+  p->len = nq ? nl - 1 - fq[1] / 2 : nl;
+  p->xlen = xl && *f[2] == '"' ? xl - 1 - fq[2] / 2 : xl;
+  const char *a = f[4], *ae = fe[4] - (fe[4] > f[4] && fe[4][-1] == '\r');
+  int neg = *a == '-';
+  const char *dot = ae - 3; // "-?[0-9]+.[0-9]{2}"
+  int64_t c = (int64_t)digits(a + neg, dot) * 100 + (dot[1] - '0') * 10 + (dot[2] - '0');
+  p->cents = neg ? -c : c;
+  p->name = nq ? f[1] + 1 : f[1];
+  if (nq && fq[1] > 2) { // escaped quotes: unescape into tmp and apply now
+    if (p->len > CHUNK)
+      die("name longer than the scratch buffer");
+    flush(t);
     char *o = t->tmp;
-    for (const char *q = ns; o < t->tmp + nlen; q++) {
+    for (const char *q = p->name; o < t->tmp + p->len; q++) {
       *o++ = *q;
       q += *q == '"';
     }
-    name = t->tmp;
+    p->name = t->tmp;
+    p->h = hash_bytes(p->name, p->len);
+    apply(t, p);
+    return;
   }
-  uint32_t g = rid < MAPN ? region[rid] : 0;
-  Agg *a = &t->agg[g];
-  a->count++;
-  a->id_sum += id;
-  a->sum += cents;
-  a->min = cents < a->min ? cents : a->min;
-  a->max = cents > a->max ? cents : a->max;
-  a->name_bytes += nlen;
-  a->note_bytes += xlen;
-  uint32_t nid = name_id(name, nlen);
-  uint64_t *w = &names[nid].groups[g / 64], bit = 1ull << (g % 64);
-  if (!(__atomic_load_n(w, __ATOMIC_RELAXED) & bit))
-    __atomic_fetch_or(w, bit, __ATOMIC_RELAXED);
-  return p;
+  p->h = hash_bytes(p->name, p->len);
+  __builtin_prefetch(&tags[p->h & (cap - 1)]);
+  __builtin_prefetch(&recs[p->h & (cap - 1)], 1);
+  __builtin_prefetch(&region[p->rid < MAPN ? p->rid : 0]);
+  if (++t->np == BATCH)
+    flush(t);
 }
 
-// Thread k counts the groups of every nth name, starting at name k.
-static void *count_names(void *arg) {
-  Th *t = arg;
-  int k = t - th;
-  for (uint32_t i = k; i < nnames; i += nth)
-    for (int w = 0; w < 4; w++)
-      for (uint64_t x = names[i].groups[w]; x; x &= x - 1)
-        t->distinct[w * 64 + __builtin_ctzll(x)]++;
-  return NULL;
+// Parse the records that start in [b, e). b is a record start, so the quote
+// state there is "outside".
+static void parse_range(Th *t, const char *b, const char *e) {
+  const char *f[5] = {b}, *fe[5], *end = data + size;
+  uint64_t fq[5], carry = 0, qc = 0, qs = 0; // quotes before the block; at the field's start
+  int k = 0;
+  for (const char *p = b;; p += 64) {
+    if (p >= end) { // end of file: an unterminated last record
+      if (k == 4) {
+        fe[4] = end;
+        record(t, f, fe, fq);
+      } else if (k || f[0] < end) {
+        die("malformed records.csv");
+      }
+      return;
+    }
+    __m256i lo = _mm256_loadu_si256((const __m256i *)p), hi = _mm256_loadu_si256((const __m256i *)(p + 32));
+    uint64_t q = eq64(lo, hi, '"'), inq = prefix_xor(q) ^ carry;
+    carry = (uint64_t)((int64_t)inq >> 63);
+    for (uint64_t sep = (eq64(lo, hi, ',') | eq64(lo, hi, '\n')) & ~inq; sep; sep &= sep - 1) {
+      int i = __builtin_ctzll(sep);
+      uint64_t cum = qc + __builtin_popcountll(q & ((2ull << i) - 1));
+      fe[k] = p + i, fq[k] = cum - qs, qs = cum;
+      if (p[i] == '\n') {
+        if (k != 4)
+          die("malformed records.csv");
+        record(t, f, fe, fq);
+        k = 0;
+        if (p + i + 1 >= e)
+          return;
+      } else if (++k > 4) {
+        die("malformed records.csv");
+      }
+      f[k] = p + i + 1;
+    }
+    qc += __builtin_popcountll(q);
+  }
+}
+
+// The first record start at or after data + o: just past an LF that a digit or a
+// BOM follows (see the header comment).
+static const char *record_start(long o) {
+  if (o <= body)
+    return data + body;
+  for (const char *p = data + o - 1, *end = data + size; p < end; p++) {
+    if (!(p = memchr(p, '\n', end - p)))
+      break;
+    if (p + 1 < end && ((p[1] >= '0' && p[1] <= '9') || (uint8_t)p[1] == 0xEF))
+      return p + 1;
+  }
+  return data + size;
 }
 
 static void *parse(void *arg) {
   Th *t = arg;
   for (int g = 0; g < ngroups; g++)
     t->agg[g] = (Agg){0, 0, 0, 0, 0, INT64_MAX, INT64_MIN};
-  size_t have = 0;
-  for (long off = t->beg;;) {
-    long want = t->end - off < (long)(BUFSZ - have) ? t->end - off : (long)(BUFSZ - have);
-    if (want > 0) {
-      ssize_t n = pread(fd, t->buf + have, want, off);
-      if (n <= 0)
-        die("read failed");
-      off += n;
-      have += n;
-    }
-    int eof = off >= t->end;
-    const char *p = t->buf, *end = t->buf + have, *q;
-    while (p < end && (q = record(t, p, end, eof)))
-      p = q;
-    if (p < end && (eof || (p == t->buf && have == BUFSZ)))
-      die("malformed records.csv");
-    have = end - p;
-    memmove(t->buf, p, have);
-    if (eof)
-      return NULL;
+  for (long c; (c = __atomic_fetch_add(&next_chunk, 1, __ATOMIC_RELAXED)) < nchunks;) {
+    const char *b = record_start(body + c * CHUNK), *e = record_start(body + (c + 1) * CHUNK);
+    if (b < e)
+      parse_range(t, b, e);
   }
+  flush(t);
+  return NULL;
+}
+
+// This thread's slice of regions.csv: "region_id,XYZ" lines. A country's group
+// is claimed once by swapping 0 for BUSY in its code's slot.
+static void *regions(void *arg) {
+  Th *t = arg;
+  for (const char *p = rdata + t->beg, *end = rdata + t->end; p < end; p += 5) { // ",XYZ\n"
+    uint64_t rid = 0;
+    for (; *p != ','; p++)
+      rid = rid * 10 + (*p - '0');
+    int code = ((p[1] - 'A') * 26 + (p[2] - 'A')) * 26 + (p[3] - 'A');
+    uint16_t g = __atomic_load_n(&by_code[code], __ATOMIC_ACQUIRE), z = 0;
+    if (!g && __atomic_compare_exchange_n(&by_code[code], &z, BUSY, 0, __ATOMIC_ACQUIRE, __ATOMIC_ACQUIRE)) {
+      g = __atomic_fetch_add(&ngroups, 1, __ATOMIC_RELAXED);
+      if (g >= MAXG)
+        die("too many countries");
+      memcpy(codes[g], p + 1, 3);
+      __atomic_store_n(&by_code[code], g, __ATOMIC_RELEASE);
+    }
+    while (!g || g == BUSY)
+      g = __atomic_load_n(&by_code[code], __ATOMIC_ACQUIRE);
+    if (rid < MAPN)
+      region[rid] = g;
+  }
+  return NULL;
+}
+
+// Thread k counts the groups of every nth name slot, starting at slot k.
+static void *count_names(void *arg) {
+  Th *t = arg;
+  for (uint32_t i = t - th; i < cap; i += nth)
+    for (int w = 0; tags[i] & 0x80 && w < 4; w++)
+      for (uint64_t x = recs[i].groups[w]; x; x &= x - 1)
+        t->distinct[w * 64 + __builtin_ctzll(x)]++;
+  return NULL;
 }
 
 static void run_threads(void *(*f)(void *)) {
@@ -256,97 +341,43 @@ static int cmp_group(const void *x, const void *y) {
 }
 
 int main(void) {
-  // regions.csv: "region_id,country" lines after the header.
-  int rf = open("/data/regions.csv", O_RDONLY);
-  struct stat st;
-  if (rf < 0 || fstat(rf, &st))
-    die("cannot open /data/regions.csv");
-  char *rb = malloc(st.st_size + 1);
-  for (long got = 0; got < st.st_size;) {
-    ssize_t n = pread(rf, rb + got, st.st_size - got, got);
-    if (n <= 0)
-      die("read failed");
-    got += n;
-  }
-  close(rf);
-  region = calloc(MAPN, sizeof *region); // only the pages up to the largest id get touched
-  int16_t *by_code = malloc(26 * 26 * 26 * sizeof *by_code);
-  memset(by_code, 0xff, 26 * 26 * 26 * sizeof *by_code);
-  ngroups = 1;
-  strcpy(codes[0], "_UNMATCHED");
-  char *p = memchr(rb, '\n', st.st_size), *rend = rb + st.st_size;
-  for (p = p ? p + 1 : rend; p < rend;) {
-    uint64_t rid = 0;
-    for (; *p != ','; p++)
-      rid = rid * 10 + (*p - '0');
-    int code = ((p[1] - 'A') * 26 + (p[2] - 'A')) * 26 + (p[3] - 'A');
-    if (by_code[code] < 0) {
-      if (ngroups == MAXG)
-        die("too many countries");
-      memcpy(codes[ngroups], p + 1, 3);
-      by_code[code] = ngroups++;
-    }
-    if (rid < MAPN)
-      region[rid] = by_code[code];
-    p += 5; // ",XYZ\n"
-  }
-  free(rb);
-  free(by_code);
-
-  fd = open("/data/records.csv", O_RDONLY);
-  if (fd < 0 || fstat(fd, &st))
-    die("cannot open /data/records.csv");
-  long size = st.st_size, body = 0;
-  { // skip the BOM and the header line
-    char c[64];
-    ssize_t n = pread(fd, c, sizeof c, 0);
-    char *nl = n > 0 ? memchr(c, '\n', n) : NULL;
-    body = nl ? nl - c + 1 : size;
-  }
-  cpu_set_t cpus; // the CPUs this container may use, not the host's count
-  nth = sched_getaffinity(0, sizeof cpus, &cpus) ? 1 : CPU_COUNT(&cpus);
-  nth = nth < 1 ? 1 : nth > 64 ? 64 : nth;
-  th = calloc(nth, sizeof(Th));
-  // Range i starts at the first record boundary (an LF followed by a digit or a
-  // BOM, see above) at or after its share of the file.
-  th[0].beg = body;
-  for (int i = 1; i < nth; i++) {
-    long pos = body + (size - body) * i / nth;
-    for (;;) {
-      unsigned char c[4096];
-      ssize_t n = pread(fd, c, sizeof c, pos), k = 0;
-      if (n <= 1) {
-        pos = size;
-        break;
-      }
-      while (k + 1 < n && !(c[k] == '\n' && ((c[k + 1] >= '0' && c[k + 1] <= '9') || c[k + 1] == 0xEF)))
-        k++;
-      pos += k + 1;
-      if (k + 1 < n)
-        break;
-      pos--; // re-read the last byte: it may be an LF whose follower is in the next window
-    }
-    th[i].beg = pos < th[i - 1].beg ? th[i - 1].beg : pos;
-  }
-  for (int i = 0; i < nth; i++) {
-    th[i].end = i + 1 < nth ? th[i + 1].beg : size;
-    th[i].buf = malloc(BUFSZ + 64);
-    th[i].tmp = malloc(BUFSZ + 64);
-  }
-
+  rdata = map_file("/data/regions.csv", &rsize);
+  data = map_file("/data/records.csv", &size);
   if (size > UINT32_MAX)
     die("records.csv over 4 GB"); // arena offsets are 32-bit
-  arena = malloc(size + 64);      // untouched pages cost nothing
-  for (cap = 1 << 18;; cap *= 4) { // redone with a larger name table if it fills
-    if (cap > 1u << IDBITS)
-      die("too many distinct names");
-    slots = calloc(cap, 8);
-    names = aligned_alloc(64, cap * sizeof(Name));
-    nnames = overflow = arena_used = 0;
+  const char *nl = memchr(data, '\n', size); // the BOM and header line
+  body = nl ? nl - data + 1 : size;
+  nchunks = (size - body + CHUNK - 1) / CHUNK;
+  cpu_set_t cpus; // the CPUs this container may use, not the host's count
+  nth = sched_getaffinity(0, sizeof cpus, &cpus) ? 1 : CPU_COUNT(&cpus);
+  nth = nth > nchunks ? nchunks : nth > 64 ? 64 : nth; // no more threads than chunks
+  nth = nth < 1 ? 1 : nth;
+  th = calloc(nth, sizeof(Th));
+
+  // regions.csv in parallel: line-aligned slices after the header.
+  region = calloc(MAPN, 1); // only the pages up to the largest id get touched
+  nl = memchr(rdata, '\n', rsize);
+  long rbody = nl ? nl - rdata + 1 : rsize;
+  for (int i = 0; i < nth; i++) {
+    long b = rbody + (rsize - rbody) * i / nth;
+    const char *q = i ? memchr(rdata + b - 1, '\n', rsize - b + 1) : NULL;
+    th[i].beg = i ? (q ? q - rdata + 1 : rsize) : rbody;
+    th[i].tmp = malloc(CHUNK + 64);
+    if (i)
+      th[i - 1].end = th[i].beg;
+  }
+  th[nth - 1].end = rsize;
+  run_threads(regions);
+
+  arena = malloc(size + 64); // untouched pages cost nothing
+  for (cap = 1 << 17;; cap *= 2) { // redone with a larger name table if it fills
+    tags = calloc(cap, 1);
+    recs = aligned_alloc(64, cap * sizeof(Rec)); // (huge pages: 11% faster, +5.8 MB; not worth it)
+    nnames = overflow = arena_used = next_chunk = 0;
     run_threads(parse);
     if (!overflow)
       break;
-    free(slots), free(names);
+    free(tags), free(recs);
   }
   run_threads(count_names);
 
@@ -356,9 +387,9 @@ int main(void) {
   uint64_t distinct[MAXG] = {0};
   for (int g = 0; g < ngroups; g++) {
     tot[g] = th[0].agg[g];
-    distinct[g] = th[0].distinct[g];
-    for (int i = 1; i < nth; i++) {
+    for (int i = 0; i < nth; i++)
       distinct[g] += th[i].distinct[g];
+    for (int i = 1; i < nth; i++) {
       Agg *a = &th[i].agg[g];
       tot[g].count += a->count;
       tot[g].id_sum += a->id_sum;
