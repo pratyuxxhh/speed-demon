@@ -1,16 +1,15 @@
 // Speed Demon 2026, Track C (Join): parse a hostile records.csv, join each record
 // to regions.csv on region_id, and aggregate per country. See specs/c-join.md.
 //
-// Parallel parsing despite LFs inside quotes: every '"' byte flips the quote
-// state (a "" escape flips it twice), so pass 1 counts the quotes in each
-// thread's byte range, and the running parity says whether each range starts
-// inside a quoted field. From there the first LF outside quotes is an exact
-// record boundary. Pass 2 parses whole records per thread. Distinct names use
-// one shared, lock-free name table and a bitset of name ids per group; notes
-// are only measured, never copied.
+// Parallel parsing despite LFs inside quotes: spec section 2.2 guarantees that a
+// note's LF is followed by a lowercase word and that names hold no LF, so an LF
+// followed by a digit or a BOM is always a record boundary. Each thread parses
+// whole records from such a boundary. Distinct names use one shared, lock-free
+// name table; each distinct name owns a 64-byte record holding its first 24
+// bytes and the set of groups it occurs in, so a lookup and its group bit touch
+// one cache line. Notes are only measured, never copied.
 #define _GNU_SOURCE
 #include <fcntl.h>
-#include <immintrin.h>
 #include <pthread.h>
 #include <sched.h>
 #include <stdint.h>
@@ -25,18 +24,21 @@
 #define MAXG 256        // groups: _UNMATCHED (0) plus the countries (240 in the spec)
 #define IDBITS 24       // name ids per table slot; the table never exceeds 2^24 slots
 #define IDMASK ((1u << IDBITS) - 1)
+#define INL 24 // name bytes kept in the record; longer names keep the rest in the arena
 
 typedef struct {
   uint64_t count, id_sum, name_bytes, note_bytes;
   int64_t sum, min, max;
 } Agg;
 typedef struct {
-  uint32_t off, len; // the name's bytes are arena[off..off+len)
-} Name;
+  uint32_t len, off;      // off: where arena holds the bytes past INL
+  uint64_t inl[INL / 8];  // the first INL bytes, zero padded
+  uint64_t groups[4];     // the groups this name occurs in
+} Name;                   // 64 bytes, one cache line
 typedef struct {
   long beg, end;
-  uint64_t quotes;
   char *buf, *tmp;
+  uint64_t distinct[MAXG];
   Agg agg[MAXG];
 } Th;
 
@@ -45,10 +47,10 @@ static Th *th;
 static uint8_t *region; // region id -> group, 0 = _UNMATCHED
 static char codes[MAXG][12]; // "XYZ" or "_UNMATCHED"
 // Name table slot: 0 empty, 1 being written, else hash bits above IDBITS | id.
-static uint64_t *slots, *seen; // and per-group bitsets of name ids
+static uint64_t *slots;
 static uint32_t cap, nnames;
 static Name *names;
-static char *arena; // every distinct name once; at most the size of records.csv
+static char *arena; // name bytes past INL; at most the size of records.csv
 static uint64_t arena_used;
 
 static void die(const char *m) {
@@ -68,10 +70,12 @@ static uint64_t hash_bytes(const char *s, uint32_t n) { // reads up to 7 bytes p
   return h | 1ull << 63; // never 0 (empty) or 1 (being written)
 }
 
-// The id of name s[0..n) in the shared table, inserting it when new. An inserter
-// claims an empty slot by swapping 0 for 1, fills it, then publishes hash | id.
+// The id of name s[0..n) in the shared table, inserted when new. An inserter
+// claims an empty slot by swapping 0 for 1, fills the record, then publishes
+// hash | id.
 static uint32_t name_id(const char *s, uint32_t n) {
-  uint64_t h = hash_bytes(s, n), key = h & ~(uint64_t)IDMASK;
+  uint64_t h = hash_bytes(s, n), key = h & ~(uint64_t)IDMASK, w[INL / 8] = {0};
+  memcpy(w, s, n < INL ? n : INL);
   for (uint32_t i = h & (cap - 1);; i = (i + 1) & (cap - 1)) {
     uint64_t v = __atomic_load_n(&slots[i], __ATOMIC_ACQUIRE);
     if (v == 0) {
@@ -80,10 +84,13 @@ static uint32_t name_id(const char *s, uint32_t n) {
         return 0;
       }
       if (__atomic_compare_exchange_n(&slots[i], &v, 1, 0, __ATOMIC_ACQUIRE, __ATOMIC_ACQUIRE)) {
-        uint64_t off = __atomic_fetch_add(&arena_used, n, __ATOMIC_RELAXED);
         uint32_t id = __atomic_fetch_add(&nnames, 1, __ATOMIC_RELAXED);
-        memcpy(arena + off, s, n);
-        names[id] = (Name){off, n};
+        Name *e = &names[id];
+        *e = (Name){n, 0, {w[0], w[1], w[2]}, {0}};
+        if (n > INL) {
+          e->off = __atomic_fetch_add(&arena_used, n - INL, __ATOMIC_RELAXED);
+          memcpy(arena + e->off, s + INL, n - INL);
+        }
         __atomic_store_n(&slots[i], key | id, __ATOMIC_RELEASE);
         return id;
       }
@@ -92,7 +99,8 @@ static uint32_t name_id(const char *s, uint32_t n) {
       v = __atomic_load_n(&slots[i], __ATOMIC_ACQUIRE);
     if ((v & ~(uint64_t)IDMASK) == key) {
       Name *e = &names[v & IDMASK];
-      if (e->len == n && memcmp(arena + e->off, s, n) == 0)
+      if (e->len == n && e->inl[0] == w[0] && e->inl[1] == w[1] && e->inl[2] == w[2] &&
+          (n <= INL || memcmp(arena + e->off, s + INL, n - INL) == 0))
         return v & IDMASK;
     }
   }
@@ -174,7 +182,7 @@ static const char *record(Th *t, const char *p, const char *end, int eof) {
     }
     name = t->tmp;
   }
-  uint32_t g = rid < MAPN ? region[rid] : 0, nid = name_id(name, nlen);
+  uint32_t g = rid < MAPN ? region[rid] : 0;
   Agg *a = &t->agg[g];
   a->count++;
   a->id_sum += id;
@@ -183,28 +191,21 @@ static const char *record(Th *t, const char *p, const char *end, int eof) {
   a->max = cents > a->max ? cents : a->max;
   a->name_bytes += nlen;
   a->note_bytes += xlen;
-  uint64_t *w = &seen[(size_t)g * (cap / 64) + nid / 64], bit = 1ull << (nid % 64);
+  uint32_t nid = name_id(name, nlen);
+  uint64_t *w = &names[nid].groups[g / 64], bit = 1ull << (g % 64);
   if (!(__atomic_load_n(w, __ATOMIC_RELAXED) & bit))
     __atomic_fetch_or(w, bit, __ATOMIC_RELAXED);
   return p;
 }
 
-static void *count_quotes(void *arg) {
+// Thread k counts the groups of every nth name, starting at name k.
+static void *count_names(void *arg) {
   Th *t = arg;
-  for (long off = t->beg; off < t->end;) {
-    long want = t->end - off < BUFSZ ? t->end - off : BUFSZ;
-    ssize_t n = pread(fd, t->buf, want, off);
-    if (n <= 0)
-      die("read failed");
-    long i = 0;
-    for (; i + 32 <= n; i += 32) {
-      __m256i v = _mm256_loadu_si256((const __m256i *)(t->buf + i));
-      t->quotes += __builtin_popcount(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8('"'))));
-    }
-    for (; i < n; i++)
-      t->quotes += t->buf[i] == '"';
-    off += n;
-  }
+  int k = t - th;
+  for (uint32_t i = k; i < nnames; i += nth)
+    for (int w = 0; w < 4; w++)
+      for (uint64_t x = names[i].groups[w]; x; x &= x - 1)
+        t->distinct[w * 64 + __builtin_ctzll(x)]++;
   return NULL;
 }
 
@@ -296,7 +297,7 @@ int main(void) {
   if (fd < 0 || fstat(fd, &st))
     die("cannot open /data/records.csv");
   long size = st.st_size, body = 0;
-  { // skip the BOM and the header line; the header holds no quotes
+  { // skip the BOM and the header line
     char c[64];
     ssize_t n = pread(fd, c, sizeof c, 0);
     char *nl = n > 0 ? memchr(c, '\n', n) : NULL;
@@ -306,66 +307,58 @@ int main(void) {
   nth = sched_getaffinity(0, sizeof cpus, &cpus) ? 1 : CPU_COUNT(&cpus);
   nth = nth < 1 ? 1 : nth > 64 ? 64 : nth;
   th = calloc(nth, sizeof(Th));
-  for (int i = 0; i < nth; i++) {
-    th[i].beg = body + (size - body) * i / nth;
-    th[i].end = body + (size - body) * (i + 1) / nth;
-    th[i].buf = malloc(BUFSZ + 64);
-    th[i].tmp = malloc(BUFSZ + 64);
-  }
-  run_threads(count_quotes);
-  // Move each range start to just after the first LF outside quotes at or after it.
-  uint64_t parity = 0;
-  long starts[65];
-  starts[0] = body;
+  // Range i starts at the first record boundary (an LF followed by a digit or a
+  // BOM, see above) at or after its share of the file.
+  th[0].beg = body;
   for (int i = 1; i < nth; i++) {
-    parity += th[i - 1].quotes;
-    long pos = th[i].beg;
-    int inq = parity & 1;
-    char c[4096];
+    long pos = body + (size - body) * i / nth;
     for (;;) {
-      ssize_t n = pread(fd, c, sizeof c, pos);
-      if (n <= 0) {
+      unsigned char c[4096];
+      ssize_t n = pread(fd, c, sizeof c, pos), k = 0;
+      if (n <= 1) {
         pos = size;
         break;
       }
-      ssize_t k = 0;
-      for (; k < n && (inq || c[k] != '\n'); k++)
-        inq ^= c[k] == '"';
-      pos += k;
-      if (k < n) {
-        pos++;
+      while (k + 1 < n && !(c[k] == '\n' && ((c[k + 1] >= '0' && c[k + 1] <= '9') || c[k + 1] == 0xEF)))
+        k++;
+      pos += k + 1;
+      if (k + 1 < n)
         break;
-      }
+      pos--; // re-read the last byte: it may be an LF whose follower is in the next window
     }
-    starts[i] = pos < starts[i - 1] ? starts[i - 1] : pos;
+    th[i].beg = pos < th[i - 1].beg ? th[i - 1].beg : pos;
   }
   for (int i = 0; i < nth; i++) {
-    th[i].beg = starts[i];
-    th[i].end = i + 1 < nth ? starts[i + 1] : size;
+    th[i].end = i + 1 < nth ? th[i + 1].beg : size;
+    th[i].buf = malloc(BUFSZ + 64);
+    th[i].tmp = malloc(BUFSZ + 64);
   }
 
   if (size > UINT32_MAX)
-    die("records.csv over 4 GB"); // name offsets are 32-bit
+    die("records.csv over 4 GB"); // arena offsets are 32-bit
   arena = malloc(size + 64);      // untouched pages cost nothing
   for (cap = 1 << 18;; cap *= 4) { // redone with a larger name table if it fills
     if (cap > 1u << IDBITS)
       die("too many distinct names");
     slots = calloc(cap, 8);
-    names = malloc(cap * sizeof(Name));
-    seen = calloc((size_t)ngroups * (cap / 64), 8);
+    names = aligned_alloc(64, cap * sizeof(Name));
     nnames = overflow = arena_used = 0;
     run_threads(parse);
     if (!overflow)
       break;
-    free(slots), free(names), free(seen);
+    free(slots), free(names);
   }
+  run_threads(count_names);
 
   // Merge the threads' aggregates and write the groups in byte order of key.
   int order[MAXG], n = 0;
   Agg tot[MAXG];
+  uint64_t distinct[MAXG] = {0};
   for (int g = 0; g < ngroups; g++) {
     tot[g] = th[0].agg[g];
+    distinct[g] = th[0].distinct[g];
     for (int i = 1; i < nth; i++) {
+      distinct[g] += th[i].distinct[g];
       Agg *a = &th[i].agg[g];
       tot[g].count += a->count;
       tot[g].id_sum += a->id_sum;
@@ -384,9 +377,6 @@ int main(void) {
     die("cannot create /out/aggregates.txt");
   for (int k = 0; k < n; k++) {
     Agg *a = &tot[order[k]];
-    uint64_t distinct = 0, *b = seen + (size_t)order[k] * (cap / 64);
-    for (uint32_t w = 0; w < cap / 64; w++)
-      distinct += __builtin_popcountll(b[w]);
     char line[256], *o = line;
     o += sprintf(o, "%s %llu %llu ", codes[order[k]], (unsigned long long)a->count,
                  (unsigned long long)a->id_sum);
@@ -395,7 +385,7 @@ int main(void) {
     o = money(o, a->min);
     *o++ = ' ';
     o = money(o, a->max);
-    sprintf(o, " %llu %llu %llu\n", (unsigned long long)distinct,
+    sprintf(o, " %llu %llu %llu\n", (unsigned long long)distinct[order[k]],
             (unsigned long long)a->name_bytes, (unsigned long long)a->note_bytes);
     fputs(line, out);
   }

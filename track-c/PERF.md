@@ -7,6 +7,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 0 | The reference, unchanged | | 14.44 | 367 | 0 |
 | 1 | C rewrite: quote-parity split, hand-written CSV parser, array join, shared name table + per-group bitsets | _not pushed yet_ | | | |
 | 2 | Memory pass: 64 KB buffers, 1-byte region map, packed name slots, one shared name arena | _not pushed yet_ | | | |
+| 3 | No quote pass (spec 2.2 boundary rule); 64-byte name records holding their groups' bits | _not pushed yet_ | | | |
 
 The board columns are filled from board runs only. Until a push is measured, the local numbers below are what we have.
 
@@ -36,6 +37,7 @@ Data: `speed-demon-2026/data/c`: 332,000 records. `records.csv` sha256 `07bc6368
 |---|---|---|---|---|---|---|
 | 1 | 2858/54 = 52.9 → 7.27 | 70.2/17.5 = 4.01 → 1.32 | 367 → 0.832 | 1 → 1 | 8.0 | 45 |
 | 2 | 2870/53 = 54.2 → 7.36 | 70.1/12.1 = 5.81 → 1.42 | 366 → 0.833 | 1 → 1 | 8.7 | 47 |
+| 3 | 2625/45 = 58.3 → 7.64 | 70.2/13.1 = 5.34 → 1.40 | 353 → 0.837 | 1 → 1 | 8.9 | 48 |
 
 The memory ratio on the sample understates the board's. The reference's peak grows with the data: 70 MB on sample, 367 MB on the board's full set. This program's peak is mostly fixed tables: the name table, the per-group bitsets, the region map and the read buffers. That is an expectation, not a measurement; full data has not been run locally.
 
@@ -103,3 +105,65 @@ The memory ratio on the sample understates the board's. The reference's peak gro
   - read buffers and stacks.
 
   The bitsets and the table are sized by the pool of about 100,000 names, which full scale shares, so they should not grow there. That is an expectation, not a measurement.
+
+## Step 3: where the time goes, and the name-table layout
+
+**Measuring first.** Phase timers in a throwaway copy of step 2 (sample):
+
+| Phase | 1 CPU | 12 CPUs |
+|---|---|---|
+| regions.csv load | 5–9 ms | 5–7 ms |
+| quote-count pass | 6–14 ms | 3–5 ms |
+| parse and aggregate | 172–193 ms | 40–52 ms |
+| output | 2–5 ms | 2–5 ms |
+
+Variants of the parse isolated its parts:
+
+| Variant | 1 CPU | 12 CPUs |
+|---|---|---|
+| CSV parsing only | 49 ms | 19–20 ms |
+| + name lookup | 67–136 ms | 33–39 ms |
+| + per-group bitsets (full step 2) | 89–193 ms | 40–49 ms |
+
+Distinct-name counting cost more than the CSV parsing itself. Each record made about four scattered reads: the hash slot, the name entry, the name bytes in the arena, and an atomic OR into a 3 MB per-group bitset.
+
+**Optimization:**
+
+1. **No quote-count pass.** Spec 2.2, which the spec says may be relied on, guarantees that a note's LF is followed by a lowercase word and that names hold no LF. So an LF followed by a digit or a BOM is always a record boundary, and each thread starts at the first one at or after its share of the file. Checked on the sample: across all 371k LFs, the byte after an LF is a digit or a lowercase letter, nothing else. This saves one read of the file and the AVX2 quote counter.
+2. **A 64-byte record per distinct name** (one cache line), holding:
+   - its length;
+   - its first 24 bytes, zero padded;
+   - an arena offset for any bytes past 24;
+   - its own 256-bit set of groups.
+
+   A lookup is then the 8-byte hash slot plus that one line, which does both the exact comparison and the group bit. On the sample, 94% of names are at most 16 bytes and all are at most 24 (measured with a one-off script), so the arena is almost never touched. `names_distinct` per group is counted after the parse, in parallel, by popcounting the records' group sets, with thread k taking every nth name.
+
+**Tried and not adopted: per-owner buckets instead of atomic group bits.** Threads logged `(group, name id)` pairs into buckets by `id % threads`, and each thread then set the bits of the names it owned, with no atomics. Same session, 7 runs each:
+
+| Variant | 1 CPU | 8 P-core threads | Peak (KiB) |
+|---|---|---|---|
+| atomic bits | 135 ms | 55 ms | 10004–12188 |
+| buckets | 113 ms | 47 ms | 11372–14080 |
+
+The buckets were about 15% faster but log 4 bytes per record: about 13 MB at full. At full the time gain is worth √1.16 ≈ ×1.08 in K, and the memory cost about (12/25)^0.2 ≈ ×0.86, so atomic bits stay.
+
+**This machine's scaling limit.** Per-thread timestamps showed some threads starting 12–27 ms late, and each of 12 threads running at 50–80 MB/s against about 250 MB/s for one thread alone. The CPU is an i5-13500H laptop chip: 4 P-cores with hyper-threading plus 8 E-cores, under a laptop power limit. A 12-thread run mixes in E-cores and lower clocks. The scoring box is 6 P-cores with hyper-threading and turbo off, so the 1-CPU time is the steadiest local measure of the code's own speed.
+
+**Result (A/B against step 2 in the same session, 7 runs each, medians):**
+
+| CPUs | step 2 | step 3 |
+|---|---|---|
+| 1 | 142 ms | 94 ms |
+| 8 (P-cores) | 52 ms | 47 ms |
+| 12 | 53 ms | 45 ms |
+
+Peak memory at 12 CPUs went from 12.0 to 13.1 MB: 64 bytes per name instead of the previous entries and bitsets. Code fell from 366 to 353 lines.
+
+**Correctness:** the full suite passed on the final code, with the ASan/UBSan build for every item:
+- the worked example;
+- the sample on 1 and 12 CPUs;
+- tiny seeds 1–5 and sample seeds 2–3 against the reference, on 1 and 12 CPUs;
+- the unterminated last record;
+- the forced name-table regrowth (starting at 1,024 slots) on 1 and 12 CPUs.
+
+All match.
