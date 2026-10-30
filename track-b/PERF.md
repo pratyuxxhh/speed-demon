@@ -6,7 +6,8 @@ Every step from the reference to your final version, each with the live-board ru
 |---|---|---|---|---|---|
 | 0 | The reference, unchanged | | 56.35 | 2,200 | 0 |
 | 1 | C rewrite: index only query terms, threaded scan, sorted posting merges, phrase check by re-tokenizing | _not pushed yet_ | | | |
-| 2 | Hybrid list/bitmap index, block SIMD tokenizer, bitmap BOOL, shared scan for all-frequent phrases, -O3 -march=x86-64-v3 | _not pushed yet_ | | | |
+| 2 | Hybrid list/bitmap index, block SIMD tokenizer, bitmap BOOL, shared scan for all-frequent phrases, -O3 -march=x86-64-v3 | _fill in from the board_ | | | |
+| 3 | Phrases matched during the scan by an Aho-Corasick automaton over term ids; block streams; batched prefetched lookups | _not pushed yet_ | | | |
 
 The board columns are filled from board runs only. Until a push is measured, the local numbers below are what we have.
 
@@ -107,3 +108,95 @@ Against the session-1 reference (5056 ms), the T ratio would be 62 and K would b
 - **The shared scan, tested by force.** The sample never triggers it, so a throwaway copy with the threshold set to 0 sent every one of the 1,900 sample phrases through it. That copy gave the same sample sha256 (`eeeec1e9…`) on 1 and on 12 CPUs, and the worked example byte for byte.
 - **Not verified here:** memory at full scale. The stream now carries only list terms, which is the change that matters at full scale and cannot be seen on the sample.
 - **Source size:** 628 code lines, up from 452. The (91/S)^0.15 factor fell from 0.786 to 0.748; the time and memory gains outweigh it.
+
+## Full-scale measurements (seed 1, generated locally)
+
+The full dataset was generated with the organisers' generator (`--seed 1 --scale full`), which is the board's dataset. `docs.txt` sha256 `6cd46167…f18e66c8` and `queries.txt` `77ef7ffc…8d39f9` match the spec. Every row below matched the published expected `results.txt` sha256 `f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927`. This is the same machine and timer as above. The reference ran once at full: **118,718 ms, 2,154 MB peak** (the board's calibration is 56.35 s, so this machine is about 2.1x slower than the scoring box).
+
+| Step | CPUs | runs | inside median (min–max), ms | peak median (KiB) |
+|---|---|---|---|---|
+| 2 | 1 | 1 | 7049 | 125892 |
+| 2 | 0-11 | 7 | 958 (902–1001) | 164324 |
+| 3 | 1 | 1 | 4382 | 112204 |
+| 3 | 0-11 | 7 | 759 (707–812) | 136956 |
+
+Same session, sample scale, 7 runs each:
+
+| Step | CPUs | ms | peak (KiB) |
+|---|---|---|---|
+| 2 | 1 | 286 | 8400 |
+| 3 | 1 | 271 | 8604 |
+| 2 | 0-11 | 80 | 15668 |
+| 3 | 0-11 | 70 | 15872 |
+
+The reference: 5873 ms and 303984 KiB at 0-11.
+
+### Local K estimates
+
+| Data | Step | T ratio | M ratio | S | K | points |
+|---|---|---|---|---|---|---|
+| full | 2 | 118718/958 = 123.9 → 11.13 | 2154/164.3 = 13.1 → 1.67 | 628 → 0.748 | 13.9 | 57 |
+| full | 3 | 118718/759 = 156.4 → 12.51 | 2154/137.0 = 15.7 → 1.74 | 633 → 0.748 | 16.2 | 61 |
+| sample | 2 | 5873/80 = 73.4 → 8.57 | 304.0/15.7 = 19.4 → 1.81 | 628 → 0.748 | 11.6 | 53 |
+| sample | 3 | 5873/70 = 83.9 → 9.16 | 304.0/15.9 = 19.2 → 1.80 | 633 → 0.748 | 12.4 | 55 |
+
+## Step 3: phrases in the scan, measured at full scale
+
+- **Problem identified on full data (step 2, 12 CPUs).** Phase timers with peak RSS:
+
+  | Phase | Time | Peak RSS after it |
+  |---|---|---|
+  | queries | 45–60 ms | 12 MB |
+  | scan | 383–650 ms | 113 MB |
+  | fill | 50–59 ms | 157 MB |
+  | shared phrase scan | 0.7 ms | 157 MB |
+  | answer | 459–511 ms | 157 MB |
+  | write | 7–14 ms | 157 MB |
+
+  - The shared scan never runs at full either: no phrase's rarest term is above N/64.
+  - The answer phase was about half the run. Its CPU time split was 794 ms for BOOL and **5270 ms for PHRASE**. Re-reading and re-tokenizing candidate documents with `pread` is what grows at full scale.
+  - The fill added 44 MB: per-thread streams and the posting array alive together.
+- **Optimization:**
+  1. **Aho-Corasick over term ids.**
+     - Every PHRASE query's term sequence goes into one trie; identical phrases share an end node. Failure links and output links are computed in order of depth.
+     - During the scan, each query-term token steps the automaton, and any other token or a document start resets it.
+     - A completed match is recorded exactly like a term, under an id after the terms. It goes through the same stamp, stream, bitmap promotion and posting slices.
+     - A PHRASE query then just reads that id's set.
+
+     This removed `phrase_in`, the candidate intersection, the shared scan and the per-document offset and length arrays.
+  2. **Streams as chains of 1 MB `mmap`ed blocks**, unmapped as the fill copies them; no `realloc` doubling. This did **not** remove the fill's extra memory. Each thread's entries are spread over every term's slice, so the whole posting array is written early in the fill while most blocks are still mapped. Peak after fill stays about streams + postings. Removing that would need compressed postings.
+  3. **Batched lookups.** Each line is tokenized first; every token's words and hash are computed, its slot is prefetched, and only then are the lookups done, so their cache misses overlap. At full the term table has 75,747 terms in 4 MB of slots, which does not fit in L2.
+  4. **Automaton fast paths:**
+     - A term in no phrase resets to the root without a lookup.
+     - At the root, only a phrase's first term moves, read from a direct per-term array.
+     - A node with one child keeps that child inline; only nodes with several children use the edge hash.
+- **What the automaton costs.** Counters, 1 CPU, full: 36.3M tokens, 23.3M automaton steps, 14.6M of them from a non-root state, 13.6M failure-link moves, and only 19,356 phrase matches. Phrases are windows of real text, so they start with common words: most tokens step the automaton and most steps fail.
+
+  | Single-thread scan variant (full) | Time |
+  |---|---|
+  | tokenize only | 774 ms |
+  | + lookup | 1531 ms |
+  | + indexing | 2538 ms |
+  | + automaton, before the fast paths | 4090 ms |
+
+  With the fast paths, the automaton still adds 1.4–1.5 s of single-thread scan time: 2356–2690 ms without it, 3733–4226 ms with it.
+- **Result (full, same session, medians):**
+
+  | CPUs | step 2 | step 3 |
+  |---|---|---|
+  | 1 | 7049 ms | 4382 ms |
+  | 12 | 958 ms | 759 ms |
+  | peak | 164 MB | 137 MB |
+
+  Answer phase at 12 CPUs went from 459–511 ms to 52–110 ms. Sample, 12 CPUs: 80 → 70 ms.
+- **Correctness:** ASan/UBSan build, `-Wall -Wextra`:
+  - the worked example, byte for byte;
+  - the sample sha256 on 1 and 12 CPUs;
+  - tiny seeds 1–3 and sample seed 2 against the reference on 1 and 12 CPUs;
+  - the full dataset's published sha256, with the optimised build.
+
+  All match.
+- **Not done:**
+  - **A 1-byte tag filter in front of the term table:** most tokens are query terms, so it would reject few.
+  - **`mmap` and chunked work for the scan:** the scan is CPU-bound, not copy-bound.
+  - **Memory under 44 MB:** it would need compressed posting lists. The 11.4M list pairs (45 MB as u32) alone exceed it.
