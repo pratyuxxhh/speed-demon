@@ -22,13 +22,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #ifndef CHUNK
 #define CHUNK (1 << 20)
 #endif
-#define MAPN 10000000 // region ids are below this
+#define MAPN 10000000 // region ids at or above this are unmatched
 #define MAXG 256      // groups: _UNMATCHED (0) and the countries
 #define INL 24        // name bytes kept in the record
 #define BATCH 32
@@ -48,7 +49,7 @@ typedef struct {
   uint64_t id;
   int64_t cents;
 } Pend;
-typedef struct {
+typedef struct __attribute__((aligned(64))) {
   Agg agg[MAXG];
   uint64_t distinct[MAXG];
   Pend pend[BATCH];
@@ -110,21 +111,13 @@ static __m256i key(const char *s, uint32_t n) {
   return _mm256_insert_epi32(k, n, 6);
 }
 
-// The CRC of the key: no loop, so no mispredicts on the name's length.
-static uint32_t hash(const char *s, uint32_t n) {
-  __m256i k = key(s, n);
-  uint64_t h = _mm_crc32_u64(0, _mm256_extract_epi64(k, 0));
-  h = _mm_crc32_u64(h, _mm256_extract_epi64(k, 1));
-  h = _mm_crc32_u64(h, _mm256_extract_epi64(k, 2));
-  return _mm_crc32_u64(h, _mm256_extract_epi64(k, 3));
-}
-
-// The record of name s[0..n), inserted when new: an inserter claims an empty
-// tag by swapping 0 for 1, fills the record, then publishes the tag.
-static Rec *name_rec(const char *s, uint32_t n, uint32_t h) {
-  uint8_t tag = 0x80 | h >> 25;
-  __m256i k = key(s, n);
-  for (uint32_t i = h & (cap - 1);; i = (i + 1) & (cap - 1)) {
+// The record of a queued record's name, inserted when new: an inserter claims
+// an empty tag by swapping 0 for 1, fills the record, then publishes the tag.
+static Rec *name_rec(const Pend *p) {
+  const char *s = p->name;
+  uint32_t n = p->raw, tag = 0x80 | p->h >> 25;
+  __m256i k = key(s, n); // again: cheaper than queueing 32 bytes more
+  for (uint32_t i = p->h & (cap - 1);; i = (i + 1) & (cap - 1)) {
     uint8_t v = __atomic_load_n(&tags[i], __ATOMIC_ACQUIRE);
     if (!v && __atomic_load_n(&nnames, __ATOMIC_RELAXED) >= cap / 8 * 7) {
       overflow = 1; // too many names: the pass is redone with a larger table
@@ -153,21 +146,19 @@ static Rec *name_rec(const char *s, uint32_t n, uint32_t h) {
   }
 }
 
-static void apply(Th *t, const Pend *p) {
-  uint32_t g = region[p->rid];
-  Agg *a = &t->agg[g];
-  a->count++, a->id_sum += p->id, a->sum += p->cents;
-  a->min = p->cents < a->min ? p->cents : a->min;
-  a->max = p->cents > a->max ? p->cents : a->max;
-  a->name_bytes += p->len, a->note_bytes += p->xlen;
-  uint64_t *w = &name_rec(p->name, p->raw, p->h)->groups[g / 64];
-  if (!(__atomic_load_n(w, __ATOMIC_RELAXED) >> g % 64 & 1)) // lock is costly
-    __atomic_fetch_or(w, 1ull << g % 64, __ATOMIC_RELAXED);
-}
-
+// The queued records applied: aggregates, and each name's group bit.
 static void flush(Th *t) {
-  for (int i = 0; i < t->np; i++)
-    apply(t, &t->pend[i]);
+  for (Pend *p = t->pend; p < t->pend + t->np; p++) {
+    uint32_t g = region[p->rid];
+    Agg *a = &t->agg[g];
+    a->count++, a->id_sum += p->id, a->sum += p->cents;
+    a->min = p->cents < a->min ? p->cents : a->min;
+    a->max = p->cents > a->max ? p->cents : a->max;
+    a->name_bytes += p->len, a->note_bytes += p->xlen;
+    uint64_t *w = &name_rec(p)->groups[g / 64];
+    if (!(__atomic_load_n(w, __ATOMIC_RELAXED) >> g % 64 & 1)) // lock is costly
+      __atomic_fetch_or(w, 1ull << g % 64, __ATOMIC_RELAXED);
+  }
   t->np = 0;
 }
 
@@ -185,9 +176,13 @@ static void record(Th *t, const char **f, const char **fe, const uint64_t *fq) {
               (ae[-1] - '0');
   Pend *p = &t->pend[t->np];
   *p = (Pend){f[1] + !!nl, 0, nl ? nl - 1 - fq[1] / 2 : 0, nl ? nl - 2 : 0,
-              xl ? xl - 1 - fq[2] / 2 : 0, num(f[3], fe[3] - f[3]),
+              xl ? xl - 1 - fq[2] / 2 : 0, fe[3] - f[3] > 7 ? MAPN : num(f[3], fe[3] - f[3]),
               num(s, fe[0] - s), neg ? -c : c};
-  p->h = hash(p->name, p->raw);
+  __m256i k = key(p->name, p->raw); // its CRC: no loop on the name's length
+  uint64_t h = _mm_crc32_u64(0, _mm256_extract_epi64(k, 0));
+  h = _mm_crc32_u64(h, _mm256_extract_epi64(k, 1));
+  h = _mm_crc32_u64(h, _mm256_extract_epi64(k, 2));
+  p->h = _mm_crc32_u64(h, _mm256_extract_epi64(k, 3));
   __builtin_prefetch(&recs[p->h & (cap - 1)], 1);
   __builtin_prefetch(&region[p->rid]);
   if (++t->np == BATCH)
@@ -208,9 +203,8 @@ static void parse_range(Th *t, const char *b, const char *e) {
   for (const char *p = b;; p += 64) {
     __m256i lo = _mm256_loadu_si256((const __m256i *)p),
             hi = _mm256_loadu_si256((const __m256i *)(p + 32));
-    uint64_t q = eq64(lo, hi, '"'), in = q;
-    for (int s = 1; s < 64; s *= 2) // prefix XOR: the bytes inside quotes
-      in ^= in << s;
+    uint64_t q = eq64(lo, hi, '"'), in = _mm_cvtsi128_si64(_mm_clmulepi64_si128(
+        _mm_cvtsi64_si128(q), _mm_set1_epi8(-1), 0));
     in ^= carry, carry = (uint64_t)((int64_t)in >> 63);
     uint64_t sep = (eq64(lo, hi, ',') | eq64(lo, hi, '\n')) & ~in;
     for (; sep; sep &= sep - 1) {
@@ -251,8 +245,9 @@ static void *parse(void *arg) {
   for (long c; (c = __atomic_fetch_add(&next_chunk, 1, __ATOMIC_RELAXED)) < nchunks;) {
     const char *b = record_start(body + c * CHUNK),
                *e = record_start(body + (c + 1) * CHUNK);
-    if (b < e)
-      parse_range(t, b, e);
+    if (b < e) // the chunk's pages in one call, not a fault each
+      madvise((void *)((uintptr_t)b & ~4095ul), e - b + 4096, 22), // POPULATE_READ
+          parse_range(t, b, e);
   }
   flush(t);
   return NULL;
@@ -277,10 +272,9 @@ static void run_threads(void *(*f)(void *)) {
     pthread_join(id[i], NULL);
 }
 
-static char *money(char *o, int64_t c) {
+static void money(FILE *o, int64_t c) {
   uint64_t a = c < 0 ? -(uint64_t)c : (uint64_t)c;
-  return o + sprintf(o, " %s%llu.%02llu", c < 0 ? "-" : "",
-                     (unsigned long long)(a / 100), (unsigned long long)(a % 100));
+  fprintf(o, " %s%lu.%02lu", c < 0 ? "-" : "", a / 100, a % 100);
 }
 
 static int by_code_name(const void *x, const void *y) {
@@ -288,10 +282,11 @@ static int by_code_name(const void *x, const void *y) {
 }
 
 int main(void) {
+  prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0); // 2 MB pages would be charged whole
   // regions.csv: "region_id,XYZ" lines after a header.
   long rsize;
   const char *r = map_file("/data/regions.csv", &rsize), *re = r + rsize;
-  region = calloc(MAPN, 1); // only the pages up to the largest id are touched
+  region = calloc(MAPN + 1, 1); // only the pages written are charged
   for (const char *p = (const char *)memchr(r, '\n', rsize) + 1; p < re; p += 5) {
     uint32_t rid = 0;
     for (; *p != ','; p++)
@@ -302,7 +297,8 @@ int main(void) {
         die("too many countries");
       memcpy(codes[ngroups], p + 1, 3), by_code[c] = ngroups++;
     }
-    region[rid] = by_code[c];
+    if (rid < MAPN) // region[MAPN] stays 0: _UNMATCHED
+      region[rid] = by_code[c];
   }
 
   data = map_file("/data/records.csv", &size);
@@ -314,7 +310,7 @@ int main(void) {
   nth = sched_getaffinity(0, sizeof cpus, &cpus) ? 1 : CPU_COUNT(&cpus);
   nth = nth > nchunks ? nchunks : nth > 64 ? 64 : nth;
   nth = nth < 1 ? 1 : nth;
-  th = calloc(nth, sizeof(Th));
+  th = aligned_alloc(64, nth * sizeof(Th)), memset(th, 0, nth * sizeof(Th));
   arena = malloc(size + 64); // untouched pages cost nothing
   for (cap = 1 << 17;; cap *= 2) { // redone with a larger table if it fills
     tags = calloc(cap, 1);
@@ -348,13 +344,10 @@ int main(void) {
     die("cannot create /out/aggregates.txt");
   for (int k = 0; k < n; k++) {
     Agg *a = &th[0].agg[order[k]];
-    char line[256], *o = line;
-    o += sprintf(o, "%s %llu %llu", codes[order[k]], (unsigned long long)a->count,
-                 (unsigned long long)a->id_sum);
-    o = money(money(money(o, a->sum), a->min), a->max);
-    sprintf(o, " %llu %llu %llu\n", (unsigned long long)th[0].distinct[order[k]],
-            (unsigned long long)a->name_bytes, (unsigned long long)a->note_bytes);
-    fputs(line, out);
+    fprintf(out, "%s %lu %lu", codes[order[k]], a->count, a->id_sum);
+    money(out, a->sum), money(out, a->min), money(out, a->max);
+    fprintf(out, " %lu %lu %lu\n", th[0].distinct[order[k]], a->name_bytes,
+            a->note_bytes);
   }
   if (fclose(out))
     die("write failed");
