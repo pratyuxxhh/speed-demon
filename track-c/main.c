@@ -43,8 +43,8 @@ typedef struct {
   uint64_t groups[4];
 } Rec; // one cache line
 typedef struct {
-  const char *name;
-  uint32_t h, len, xlen, rid;
+  const char *name; // as written, between its quotes
+  uint32_t h, len, raw, xlen, rid; // len: after unescaping; raw: as written
   uint64_t id;
   int64_t cents;
 } Pend;
@@ -53,7 +53,6 @@ typedef struct {
   uint64_t distinct[MAXG];
   Pend pend[BATCH];
   int np;
-  char *tmp;
 } Th;
 
 static const char *data;
@@ -99,26 +98,32 @@ static uint64_t num(const char *s, long n) {
   return (v * 10000 + (v >> 32)) & 0xFFFFFFFF;
 }
 
-static uint32_t hash(const char *s, uint32_t n) { // reads up to 7 bytes past
-  uint64_t h = n, w;
-  for (uint32_t i = 0; i < n; i += 8) {
-    memcpy(&w, s + i, 8);
-    h = _mm_crc32_u64(h, n - i < 8 ? w & ((1ull << 8 * (n - i)) - 1) : w);
-  }
-  return h;
+// A name as its record starts: its first 24 bytes, zero padded, then its
+// length (reads 32 bytes from s).
+static __m256i key(const char *s, uint32_t n) {
+  __m256i k = _mm256_and_si256(
+      _mm256_loadu_si256((const __m256i *)s),
+      _mm256_cmpgt_epi8(_mm256_set1_epi8(n < INL ? n : INL),
+                        _mm256_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
+                                         13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
+                                         23, 24, 25, 26, 27, 28, 29, 30, 31)));
+  return _mm256_insert_epi32(k, n, 6);
+}
+
+// The CRC of the key: no loop, so no mispredicts on the name's length.
+static uint32_t hash(const char *s, uint32_t n) {
+  __m256i k = key(s, n);
+  uint64_t h = _mm_crc32_u64(0, _mm256_extract_epi64(k, 0));
+  h = _mm_crc32_u64(h, _mm256_extract_epi64(k, 1));
+  h = _mm_crc32_u64(h, _mm256_extract_epi64(k, 2));
+  return _mm_crc32_u64(h, _mm256_extract_epi64(k, 3));
 }
 
 // The record of name s[0..n), inserted when new: an inserter claims an empty
 // tag by swapping 0 for 1, fills the record, then publishes the tag.
 static Rec *name_rec(const char *s, uint32_t n, uint32_t h) {
   uint8_t tag = 0x80 | h >> 25;
-  __m256i k = _mm256_and_si256( // the name's first 24 bytes, zero padded, then n
-      _mm256_loadu_si256((const __m256i *)s),
-      _mm256_cmpgt_epi8(_mm256_set1_epi8(n < INL ? n : INL),
-                        _mm256_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
-                                         13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
-                                         23, 24, 25, 26, 27, 28, 29, 30, 31)));
-  k = _mm256_insert_epi32(k, n, 6);
+  __m256i k = key(s, n);
   for (uint32_t i = h & (cap - 1);; i = (i + 1) & (cap - 1)) {
     uint8_t v = __atomic_load_n(&tags[i], __ATOMIC_ACQUIRE);
     if (!v && __atomic_load_n(&nnames, __ATOMIC_RELAXED) >= cap / 8 * 7) {
@@ -155,7 +160,7 @@ static void apply(Th *t, const Pend *p) {
   a->min = p->cents < a->min ? p->cents : a->min;
   a->max = p->cents > a->max ? p->cents : a->max;
   a->name_bytes += p->len, a->note_bytes += p->xlen;
-  uint64_t *w = &name_rec(p->name, p->len, p->h)->groups[g / 64];
+  uint64_t *w = &name_rec(p->name, p->raw, p->h)->groups[g / 64];
   if (!(__atomic_load_n(w, __ATOMIC_RELAXED) >> g % 64 & 1)) // lock is costly
     __atomic_fetch_or(w, 1ull << g % 64, __ATOMIC_RELAXED);
 }
@@ -168,7 +173,9 @@ static void flush(Th *t) {
 
 // One record from its fields [f[i], fe[i]) and the quote bytes in each. A
 // quoted field of raw length L with Q quote bytes holds L - 1 - Q/2 bytes;
-// by 2.2 a name or note that is not quoted is empty.
+// by 2.2 a name or note that is not quoted is empty. A name is known by its
+// bytes as written: escaping (" as "") is one to one, so two names are equal
+// exactly when their written forms are, and nothing is unescaped.
 static void record(Th *t, const char **f, const char **fe, const uint64_t *fq) {
   const char *s = f[0] + 3 * ((uint8_t)*f[0] == 0xEF); // a BOM is not data
   const char *a = f[4], *ae = fe[4] - (fe[4][-1] == '\r');
@@ -177,25 +184,11 @@ static void record(Th *t, const char **f, const char **fe, const uint64_t *fq) {
   int64_t c = num(a + neg, ae - 3 - a - neg) * 100 + (ae[-2] - '0') * 10 +
               (ae[-1] - '0');
   Pend *p = &t->pend[t->np];
-  *p = (Pend){f[1] + !!nl, 0, nl ? nl - 1 - fq[1] / 2 : 0,
+  *p = (Pend){f[1] + !!nl, 0, nl ? nl - 1 - fq[1] / 2 : 0, nl ? nl - 2 : 0,
               xl ? xl - 1 - fq[2] / 2 : 0, num(f[3], fe[3] - f[3]),
               num(s, fe[0] - s), neg ? -c : c};
-  if (fq[1] > 2) { // escaped quotes: unescape into tmp and apply now
-    Pend x = *p;
-    char *o = t->tmp;
-    x.name = t->tmp;
-    if (x.len > CHUNK)
-      die("name longer than the scratch buffer");
-    for (const char *q = p->name; o < t->tmp + x.len; q++)
-      *o++ = *q, q += *q == '"';
-    x.h = hash(x.name, x.len);
-    flush(t);
-    return apply(t, &x);
-  }
-  p->h = hash(p->name, p->len);
-  __builtin_prefetch(&tags[p->h & (cap - 1)]);
-  __builtin_prefetch(&recs[p->h & (cap - 1)], 1); // and the next slot, where
-  __builtin_prefetch(&recs[(p->h + 1) & (cap - 1)], 1); // a name often sits
+  p->h = hash(p->name, p->raw);
+  __builtin_prefetch(&recs[p->h & (cap - 1)], 1);
   __builtin_prefetch(&region[p->rid]);
   if (++t->np == BATCH)
     flush(t);
@@ -322,8 +315,6 @@ int main(void) {
   nth = nth > nchunks ? nchunks : nth > 64 ? 64 : nth;
   nth = nth < 1 ? 1 : nth;
   th = calloc(nth, sizeof(Th));
-  for (int i = 0; i < nth; i++)
-    th[i].tmp = malloc(CHUNK + 64);
   arena = malloc(size + 64); // untouched pages cost nothing
   for (cap = 1 << 17;; cap *= 2) { // redone with a larger table if it fills
     tags = calloc(cap, 1);
