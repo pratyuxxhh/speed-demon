@@ -2,15 +2,14 @@
 // PHRASE queries over a one-document-per-line corpus. See specs/b-index.md.
 //
 // The queries are read first and their terms interned; only those terms are
-// indexed. The phrases' term sequences go into one Aho-Corasick automaton, and
-// a phrase match is indexed like one more term, so PHRASE queries read a
-// finished result. Threads scan disjoint line ranges of docs.txt and look each
-// token up. A term starts as a sorted id list: its matches go to a per-thread
-// stream of 1 MB blocks that is later scattered into one posting array (sorted
-// by construction, because each thread owns a contiguous run of ids), each
-// block unmapped once copied. Once a term turns out to be frequent it is
-// promoted to a shared bitmap and set directly. BOOL queries combine lists and
-// bitmaps left to right.
+// looked up. The phrases' term sequences go into one Aho-Corasick automaton,
+// and a phrase match counts like one more term. No index is built: docs.txt is
+// mapped, each thread scans a line-aligned range in batches of 64 documents,
+// and records in present[slot] one bit per document of the batch for every
+// term or phrase it holds. After each batch the queries are evaluated over
+// those words left to right (& | &~), and their matches counted at once; a
+// query is skipped when none of its trigger slots (chosen from a sample of
+// the corpus) shows up in the batch, since it then cannot match.
 #define _GNU_SOURCE
 #include <fcntl.h>
 #include <immintrin.h>
@@ -24,12 +23,12 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#define BUFSZ (1 << 18) // read buffer per thread; a line is at most a few tens of KB
+#define CH (1 << 12) // a line is tokenized in chunks of at most this many bytes (cut at a separator)
 #define OUTSZ (1 << 16)
-#define MAXT 8         // terms per query
-#define DOC (1u << 31) // stream marker: the following terms belong to this doc
+#define MAXT 8 // terms per query
 #define NONE UINT32_MAX
-#define BLKN ((1 << 18) - 4) // stream entries per 1 MB block
+#define OPS 30 // a program entry is slot | op << OPS; op 0 AND (or first), 1 OR, 2 NOT
+#define SAMPLE 48 // batches sampled to estimate how often each slot shows up
 
 typedef struct {
   uint64_t w[4]; // the term's bytes, zero padded; terms are at most 32 bytes
@@ -42,60 +41,55 @@ typedef struct {
 typedef struct {
   uint8_t phrase, n;
   char op[MAXT];
-  uint32_t t[MAXT]; // terms; a phrase's index id (after the terms) is t[0]
+  uint32_t t[MAXT]; // terms; a phrase's id (after the terms) is t[0]
 } Query;
 typedef struct {
   uint32_t count, m, ids[10];
   uint64_t sum;
 } Result;
-typedef struct {
-  uint32_t stamp, cnt; // last doc + 1 that counted this id; then the write cursor
-} Tc;
-typedef struct Blk {
-  struct Blk *next;
-  uint32_t n, v[BLKN];
-} Blk;
+typedef struct __attribute__((packed)) {
+  uint32_t cnt; // a query's matches so far, and their sum
+  uint64_t sum;
+} Qs;
 typedef struct {
   long beg, end;
-  char *buf;
-  Tc *tc;
-  Blk *head, *tail;
-  uint32_t *la, *lb, *tokids, first, wlo, whi; // first doc id; its, the last's word
-  uint64_t *bits, *tw;                          // tw: 4 words per token of a line
+  uint64_t *present, *tw, *log; // tw: 4 words per token of a chunk
+  Qs *qr;                       // per query, in program order
+  uint32_t *touched, *tokids, nt, base, doc[64]; // base: doc[0] when the ids run on by one, else NONE
+  size_t nlog, logcap; // log: (query << 32 | doc) for each query's first 10 matches here
 } Th;
-typedef struct {
-  const uint32_t *l; // sorted ids l[0..n) when b is NULL
-  const uint64_t *b; // otherwise a bitmap of W words
-  size_t n;
-} Set;
 
 static Term *terms;
 static Slot *slots;
-static uint32_t nterms, tcap, smask, nids;
+static uint32_t nterms, tcap, smask, nids, nslots, *slot, *prog, *qoff;
+static uint32_t *toff, *trig; // the queries slot s triggers: trig[toff[s]..toff[s + 1])
+static uint32_t *freq;        // per slot: in how many sampled batches it showed up
 static Query *qs;
 static Result *res;
-static uint32_t nq, N, W, *df, *pstart, *post, lcap;
+static uint32_t nq;
 // The phrase automaton: node 0 is the root; edges (node, term) live in a hash.
+// outp is a node's phrase: its id while building, then its slot.
 static uint32_t nnode, *fail, *outp, *olink, *par, *lab, *gval, gmask;
-static uint64_t *gkey, **bm;
+static uint64_t *gkey;
 static uint8_t *inph; // per term: 1 in some phrase, 2 first in some phrase
 // Fast paths: the root's children by term, and each node's child when it has one.
 static uint32_t *root_next, *kid, *kid_lab;
 #define MULTI (NONE - 1) // kid: several children, look them up in the hash
-static int fd, nth, next_q;
+static int nth;
+static const char *map;
 static Th *th;
-static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
 
 static void die(const char *m) {
   fprintf(stderr, "%s\n", m);
   exit(1);
 }
 
+// CRC32C over the term's 8-byte words, seeded with its length.
 static uint32_t hash_words(const uint64_t *w, uint32_t len) {
-  uint64_t h = len * 0x9E3779B97F4A7C15ull;
-  for (uint32_t i = 0; i < (len + 7) / 8; i++)
-    h = (h ^ w[i]) * 0xFF51AFD7ED558CCDull;
-  return (uint32_t)(h >> 32);
+  uint64_t h = _mm_crc32_u64(len, w[0]);
+  for (uint32_t i = 1; i < (len + 7) / 8; i++)
+    h = _mm_crc32_u64(h, w[i]);
+  return (uint32_t)h;
 }
 
 // The id of the zero-padded token w, or NONE when it is not a query term.
@@ -122,6 +116,20 @@ static void place(uint32_t id) {
   slots[i] = (Slot){t->w[0], t->len, id + 1};
 }
 
+// The final table, once every term is in: the smallest power of two that keeps
+// the load at most 2/3, and the terms array cut to its size.
+static void rehash(void) {
+  uint32_t sz = 1;
+  while (sz < nterms + nterms / 2 + 1)
+    sz <<= 1;
+  free(slots);
+  smask = sz - 1;
+  slots = calloc(sz, sizeof(Slot));
+  terms = realloc(terms, (nterms + 1) * sizeof(Term));
+  for (uint32_t i = 0; i < nterms; i++)
+    place(i);
+}
+
 static uint32_t intern(const char *s, uint32_t len) {
   if (len > 32)
     die("query term longer than 32 bytes");
@@ -129,7 +137,7 @@ static uint32_t intern(const char *s, uint32_t len) {
     tcap = tcap ? tcap * 2 : 1024;
     terms = realloc(terms, tcap * sizeof(Term));
     free(slots);
-    smask = tcap * 2 - 1;
+    smask = tcap * 2 - 1; // load at most 1/2
     slots = calloc(smask + 1, sizeof(Slot));
     for (uint32_t i = 0; i < nterms; i++)
       place(i);
@@ -169,6 +177,8 @@ static uint32_t step(uint32_t s, uint32_t t) {
   return kid_lab[s] == t ? kid[s] : NONE;
 }
 
+static int is_tok(uint8_t c) { return (uint8_t)((c | 0x20) - 'a') < 26 || (uint8_t)(c - '0') < 10; }
+
 // Bit i is set when p[i] is a token byte: A-Z, a-z or 0-9 (c | 0x20 folds A-Z
 // onto a-z and leaves a-z and 0-9 alone).
 static uint32_t token_mask(const uint8_t *p) {
@@ -195,8 +205,8 @@ static void words_of(const uint8_t *p, uint32_t n, uint64_t *w) {
 // The term ids (NONE for other tokens) of the text [s, e), 64 bytes at a time:
 // a token starts where the mask rises and ends where it falls. The tokens are
 // collected first and their table slots prefetched, so the lookups' cache misses
-// overlap. Reads up to 64 bytes past e, so every tokenized buffer has 64 bytes
-// of slack. tw needs 4 words per token.
+// overlap. Reads up to 64 bytes past e, so the mapping has a page of slack.
+// tw needs 4 words per token.
 static uint32_t tokenize(const uint8_t *s, const uint8_t *e, uint32_t *ids, uint64_t *tw) {
   uint32_t n = 0;
   uint64_t in = 0; // 1 when a token runs into the next block
@@ -225,247 +235,196 @@ static uint32_t tokenize(const uint8_t *s, const uint8_t *e, uint32_t *ids, uint
   return n;
 }
 
-static int bit(const uint64_t *b, uint32_t d) { return b[d >> 6] >> (d & 63) & 1; }
-
-// Only the words holding a thread's first and last document can be shared with
-// a neighbouring thread; every other word of a shared bitmap is this thread's.
-static void set_bit(Th *t, uint64_t *b, uint32_t d) {
-  uint32_t w = d >> 6;
-  if (w == t->wlo || w == t->whi)
-    __atomic_fetch_or(&b[w], 1ull << (d & 63), __ATOMIC_RELAXED);
-  else
-    b[w] |= 1ull << (d & 63);
+// Set bit b of present[sl], remembering the slot so the batch can clear it.
+static void mark(Th *t, uint32_t sl, uint64_t b) {
+  t->touched[t->nt] = sl;
+  t->nt += !t->present[sl];
+  t->present[sl] |= b;
 }
 
-static void push(Th *t, uint32_t v) {
-  if (!t->tail || t->tail->n == BLKN) {
-    Blk *b = mmap(NULL, sizeof(Blk), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (b == MAP_FAILED)
-      die("out of memory");
-    *(t->tail ? &t->tail->next : &t->head) = b;
-    t->tail = b;
-  }
-  t->tail->v[t->tail->n++] = v;
-}
-
-static void promote(uint32_t id) {
-  pthread_mutex_lock(&mu);
-  if (!bm[id])
-    __atomic_store_n(&bm[id], calloc(W, 8), __ATOMIC_RELEASE);
-  pthread_mutex_unlock(&mu);
-}
-
-// Record that document doc holds id (a term, or a phrase after the terms).
-static void note(Th *t, uint32_t id, uint32_t doc, int *marked) {
-  if (t->tc[id].stamp == doc + 1)
-    return;
-  t->tc[id].stamp = doc + 1;
-  uint64_t *b = __atomic_load_n(&bm[id], __ATOMIC_ACQUIRE);
-  if (b) {
-    set_bit(t, b, doc);
-    return;
-  }
-  if (++t->tc[id].cnt > 64 && t->tc[id].cnt * 32ull > doc - t->first + 1ull)
-    promote(id); // frequent: from the next document on, set bits directly
-  if (!*marked) {
-    push(t, DOC | doc);
-    *marked = 1;
-  }
-  push(t, id);
-}
-
-// Index the lines of [p, lim): each term, and each phrase the automaton completes.
-static void index_lines(Th *t, const char *p, const char *lim) {
-  while (p < lim) {
-    uint32_t doc = 0, st = 0;
-    for (; *p != '\t'; p++)
-      doc = doc * 10 + (*p - '0');
-    const uint8_t *s = (const uint8_t *)++p, *e = memchr(p, '\n', lim - p);
-    int marked = 0;
-    for (uint32_t i = 0, n = tokenize(s, e, t->tokids, t->tw); i < n; i++) {
+// Mark, with bit b, each term and each phrase the automaton completes in [s, e).
+static void index_line(Th *t, const uint8_t *s, const uint8_t *e, uint64_t b) {
+  uint32_t st = 0;
+  while (s < e) {
+    const uint8_t *c = e; // this chunk is [s, c), and c is a separator or e
+    if (e - s > CH) {
+      for (c = s + CH; c > s && is_tok(*c); c--)
+        ;
+      if (c == s) // (s, s + CH] is one token: run on to its end
+        for (c = s + CH; c < e && is_tok(*c); c++)
+          ;
+    }
+    for (uint32_t i = 0, n = tokenize(s, c, t->tokids, t->tw); i < n; i++) {
       uint32_t id = t->tokids[i], g = NONE;
-      if (id != NONE)
-        note(t, id, doc, &marked);
-      if (id == NONE || !(inph[id] & (st ? 1 : 2))) {
-        st = 0; // a token in no phrase breaks every phrase; from the root, only a first term moves
+      if (id == NONE) {
+        st = 0; // a token in no phrase breaks every phrase
+        continue;
+      }
+      if (slot[id] != NONE)
+        mark(t, slot[id], b);
+      if (!(inph[id] & (st ? 1 : 2))) {
+        st = 0; // from the root, only a first term moves
         continue;
       }
       while ((g = step(st, id)) == NONE && st)
         st = fail[st];
       st = g == NONE ? 0 : g;
       for (uint32_t o = outp[st] != NONE ? st : olink[st]; o != NONE; o = olink[o])
-        note(t, nterms + outp[o], doc, &marked);
+        mark(t, outp[o], b);
     }
-    p = (const char *)e + 1;
+    s = c;
   }
+}
+
+static void log_match(Th *t, uint32_t q, uint32_t d) {
+  if (t->nlog == t->logcap) {
+    t->logcap = t->logcap ? t->logcap * 2 : 4096;
+    if (!(t->log = realloc(t->log, t->logcap * 8)))
+      die("out of memory");
+  }
+  t->log[t->nlog++] = (uint64_t)q << 32 | d;
+}
+
+// The sum of the positions of m's set bits: bit b of a position is set in the
+// positions picked out by the b-th mask.
+static uint64_t bit_positions(uint64_t m) {
+  static const uint64_t mk[6] = {0xAAAAAAAAAAAAAAAAull, 0xCCCCCCCCCCCCCCCCull, 0xF0F0F0F0F0F0F0F0ull,
+                                 0xFF00FF00FF00FF00ull, 0xFFFF0000FFFF0000ull, 0xFFFFFFFF00000000ull};
+  uint64_t s = 0;
+  for (int b = 0; b < 6; b++)
+    s += (uint64_t)__builtin_popcountll(m & mk[b]) << b;
+  return s;
+}
+
+// Query q (in program order) over the batch: its entries left to right on the
+// present words, then its matching documents counted, summed and, among its
+// first ten in this thread, logged under the query's input number.
+static void run_query(Th *t, uint32_t q) {
+  const uint32_t *p = prog + qoff[q];
+  uint32_t n = p[-1] & 0xff, lo = p[-1] >> 8 & 0xff; // lo: the index of the last OR, or 0
+  uint64_t m = t->present[p[0]];
+  for (uint32_t i = 1; i < n && (m || i <= lo); i++) { // empty stays empty without an OR
+    uint32_t e = p[i], op = e >> OPS;
+    uint64_t s = t->present[e & ((1u << OPS) - 1)];
+    m = op == 1 ? m | s : m & (op == 2 ? ~s : s);
+  }
+  if (!m)
+    return;
+  Qs *r = &t->qr[q];
+  uint32_t c = r->cnt, pc = __builtin_popcountll(m);
+  r->cnt = c + pc;
+  if (t->base != NONE) { // the batch's ids are base, base + 1, ...
+    r->sum += (uint64_t)pc * t->base + bit_positions(m);
+    for (; m && c < 10; m &= m - 1, c++)
+      log_match(t, p[-2], t->base + __builtin_ctzll(m));
+    return;
+  }
+  for (; m; m &= m - 1) {
+    uint32_t d = t->doc[__builtin_ctzll(m)];
+    r->sum += d;
+    if (c++ < 10)
+      log_match(t, p[-2], d);
+  }
+}
+
+// Slots of query q such that every document it matches holds one of them, the
+// cheapest by freq: left to right, x AND s lies within x and within s, x OR s
+// within the union, and x NOT s within x. Returns their number.
+static uint32_t triggers(uint32_t q, uint32_t *ts) {
+  const uint32_t *e = prog + qoff[q];
+  uint32_t n = 1, cost = freq[e[0]];
+  ts[0] = e[0];
+  for (uint32_t k = 1, nk = e[-1] & 0xff; k < nk; k++) {
+    uint32_t s = e[k] & ((1u << OPS) - 1), op = e[k] >> OPS, j = 0;
+    if (op == 0 && freq[s] < cost)
+      ts[0] = s, n = 1, cost = freq[s];
+    else if (op == 1) {
+      while (j < n && ts[j] != s)
+        j++;
+      if (j == n) // each slot once
+        ts[n++] = s, cost += freq[s];
+    }
+  }
+  return n;
+}
+
+// Every query over the batch, then a clean present for the next. Only a query
+// one of whose triggers some document of the batch holds can match. Each runs
+// once, from the first of its triggers that the batch holds.
+static void evaluate(Th *t, uint32_t k) {
+  t->base = t->doc[0];
+  for (uint32_t i = 1; i < k; i++)
+    if (t->doc[i] != t->doc[0] + i)
+      t->base = NONE;
+  for (uint32_t i = 0; i < t->nt; i++) {
+    uint32_t s = t->touched[i];
+    for (uint32_t j = toff[s], je = toff[s + 1]; j < je; j++) {
+      const uint32_t *p = prog + qoff[trig[j]], *tr = p + (p[-1] & 0xff);
+      if (p[-1] >> 16 > 1) {
+        while (*tr != s && !t->present[*tr])
+          tr++;
+        if (*tr != s)
+          continue;
+      }
+      run_query(t, trig[j]);
+    }
+  }
+  for (uint32_t i = 0; i < t->nt; i++)
+    t->present[t->touched[i]] = 0;
+  t->nt = 0;
+}
+
+// A sampled batch: each slot it holds counts once in freq.
+static void tally(Th *t, uint32_t k) {
+  (void)k;
+  for (uint32_t i = 0; i < t->nt; i++) {
+    __atomic_fetch_add(&freq[t->touched[i]], 1, __ATOMIC_RELAXED);
+    t->present[t->touched[i]] = 0;
+  }
+  t->nt = 0;
+}
+
+// The lines from p (a line start) to lim, in batches of 64, each handed to
+// done; stops after nb batches.
+static void batches(Th *t, const char *p, const char *lim, long nb, void (*done)(Th *, uint32_t)) {
+  uint32_t k = 0;
+  while (p < lim && nb) {
+    uint32_t doc = 0;
+    for (; *p != '\t'; p++)
+      doc = doc * 10 + (*p - '0');
+    const char *s = ++p, *e = memchr(p, '\n', lim - p);
+    if (!e)
+      e = lim; // a last line without a newline
+    index_line(t, (const uint8_t *)s, (const uint8_t *)e, 1ull << k);
+    t->doc[k++] = doc;
+    if (k == 64) {
+      done(t, k);
+      k = 0, nb--;
+    }
+    p = e + 1;
+  }
+  if (k)
+    done(t, k);
+}
+
+// A few batches spread over this thread's range, to estimate how often each
+// slot shows up in a batch.
+static void *sample(void *arg) {
+  Th *t = arg;
+  for (int j = 0, ns = (SAMPLE + nth - 1) / nth; j < ns; j++) {
+    long b = t->beg + (t->end - t->beg) * j / ns;
+    if (b > t->beg && map[b - 1] != '\n') {
+      const char *nl = memchr(map + b, '\n', t->end - b);
+      b = nl ? nl + 1 - map : t->end;
+    }
+    batches(t, map + b, map + t->end, 1, tally);
+  }
+  return NULL;
 }
 
 static void *scan(void *arg) {
   Th *t = arg;
-  size_t have = 0;
-  for (long off = t->beg; off < t->end;) {
-    long want = t->end - off;
-    if (want > (long)(BUFSZ - have))
-      want = BUFSZ - have;
-    ssize_t n = pread(fd, t->buf + have, want, off);
-    if (n <= 0)
-      die("read failed");
-    off += n;
-    have += n;
-    char *last = memrchr(t->buf, '\n', have);
-    if (!last)
-      continue;
-    index_lines(t, t->buf, last + 1);
-    have -= last + 1 - t->buf;
-    memmove(t->buf, last + 1, have);
-  }
-  return NULL;
-}
-
-// Scatter this thread's stream into the posting array (tc holds its cursors)
-// or, for an id promoted after some of its matches were streamed, its bitmap.
-// Each block is unmapped once copied, so streams and postings never both peak.
-static void *fill(void *arg) {
-  Th *t = arg;
-  uint32_t doc = 0;
-  for (Blk *b = t->head, *nx; b; b = nx) {
-    for (uint32_t i = 0; i < b->n; i++) {
-      uint32_t v = b->v[i];
-      if (v & DOC)
-        doc = v & ~DOC;
-      else if (bm[v])
-        set_bit(t, bm[v], doc);
-      else
-        post[t->tc[v].cnt++] = doc;
-    }
-    nx = b->next;
-    munmap(b, sizeof(Blk));
-  }
-  return NULL;
-}
-
-// First index i >= lo with a[i] >= x, galloping from lo.
-static size_t gallop(const uint32_t *a, size_t lo, size_t n, uint32_t x) {
-  size_t step = 1, hi = lo;
-  while (hi < n && a[hi] < x) {
-    lo = hi + 1;
-    hi += step;
-    step <<= 1;
-  }
-  if (hi > n)
-    hi = n;
-  while (lo < hi) {
-    size_t mid = (lo + hi) / 2;
-    if (a[mid] < x)
-      lo = mid + 1;
-    else
-      hi = mid;
-  }
-  return lo;
-}
-
-static Set term_set(uint32_t t) {
-  return bm[t] ? (Set){NULL, bm[t], df[t]} : (Set){post + pstart[t], NULL, df[t]};
-}
-
-// One left-to-right step: r op s, into this thread's buffers.
-static Set apply(Th *t, Set r, char op, Set s) {
-  uint32_t *o = r.l == t->la ? t->lb : t->la;
-  uint64_t *bw = t->bits;
-  size_t k = 0;
-  if (!r.b && !s.b) {
-    if (op == 'O' && r.n + s.n > lcap) { // too big for a list: switch to a bitmap
-      memset(bw, 0, W * 8ull);
-      for (size_t i = 0; i < r.n; i++)
-        bw[r.l[i] >> 6] |= 1ull << (r.l[i] & 63);
-      for (size_t i = 0; i < s.n; i++)
-        bw[s.l[i] >> 6] |= 1ull << (s.l[i] & 63);
-      return (Set){NULL, bw, 0};
-    }
-    if (op == 'O') {
-      size_t i = 0, j = 0;
-      while (i < r.n && j < s.n) {
-        uint32_t x = r.l[i], y = s.l[j];
-        o[k++] = x < y ? x : y;
-        i += x <= y;
-        j += y <= x;
-      }
-      while (i < r.n)
-        o[k++] = r.l[i++];
-      while (j < s.n)
-        o[k++] = s.l[j++];
-    } else if (op == 'A' && s.n < r.n) {
-      for (size_t i = 0, j = 0; i < s.n && j < r.n; i++)
-        if ((j = gallop(r.l, j, r.n, s.l[i])) < r.n && r.l[j] == s.l[i])
-          o[k++] = s.l[i];
-    } else {
-      for (size_t i = 0, j = 0; i < r.n; i++) {
-        j = gallop(s.l, j, s.n, r.l[i]);
-        if ((j < s.n && s.l[j] == r.l[i]) == (op == 'A'))
-          o[k++] = r.l[i];
-      }
-    }
-    return (Set){o, NULL, k};
-  }
-  if (!r.b && op != 'O') { // list AND/NOT bitmap
-    for (size_t i = 0; i < r.n; i++)
-      if (bit(s.b, r.l[i]) == (op == 'A'))
-        o[k++] = r.l[i];
-    return (Set){o, NULL, k};
-  }
-  if (r.b && !s.b && op == 'A') { // bitmap AND list
-    for (size_t i = 0; i < s.n; i++)
-      if (bit(r.b, s.l[i]))
-        o[k++] = s.l[i];
-    return (Set){o, NULL, k};
-  }
-  if (!r.b) { // list OR bitmap: start from the bitmap
-    memcpy(bw, s.b, W * 8ull);
-    for (size_t i = 0; i < r.n; i++)
-      bw[r.l[i] >> 6] |= 1ull << (r.l[i] & 63);
-    return (Set){NULL, bw, 0};
-  }
-  if (r.b != bw)
-    memcpy(bw, r.b, W * 8ull);
-  if (!s.b)
-    for (size_t i = 0; i < s.n; i++)
-      if (op == 'O')
-        bw[s.l[i] >> 6] |= 1ull << (s.l[i] & 63);
-      else
-        bw[s.l[i] >> 6] &= ~(1ull << (s.l[i] & 63));
-  else
-    for (uint32_t i = 0; i < W; i++)
-      bw[i] = op == 'A' ? bw[i] & s.b[i] : op == 'O' ? bw[i] | s.b[i] : bw[i] & ~s.b[i];
-  return (Set){NULL, bw, 0};
-}
-
-static void add(Result *o, uint32_t d) {
-  if (o->count < 10)
-    o->ids[o->m++] = d;
-  o->count++;
-  o->sum += d;
-}
-
-static void summarize(Set r, Result *o) {
-  if (!r.b)
-    for (size_t i = 0; i < r.n; i++)
-      add(o, r.l[i]);
-  else
-    for (uint32_t w = 0; w < W; w++)
-      for (uint64_t x = r.b[w]; x; x &= x - 1)
-        add(o, w * 64 + __builtin_ctzll(x));
-}
-
-static void *answer(void *arg) {
-  Th *t = arg;
-  for (uint32_t qi; (qi = __atomic_fetch_add(&next_q, 16, __ATOMIC_RELAXED)) < nq;)
-    for (uint32_t q_end = qi + 16 < nq ? qi + 16 : nq; qi < q_end; qi++) {
-      const Query *q = &qs[qi];
-      Set r = term_set(q->t[0]);
-      for (uint32_t i = 1; !q->phrase && i < q->n; i++)
-        r = apply(t, r, q->op[i], term_set(q->t[i]));
-      summarize(r, &res[qi]);
-    }
+  batches(t, map + t->beg, map + t->end, -1, evaluate);
   return NULL;
 }
 
@@ -513,7 +472,6 @@ int main(void) {
   for (long i = 0; i < qsize; i++)
     nq += qb[i] == '\n';
   qs = calloc(nq + 1, sizeof(Query));
-  res = calloc(nq + 1, sizeof(Result));
   char *p = qb;
   uint32_t edges = 1;
   for (uint32_t i = 0; i < nq; i++) {
@@ -538,11 +496,13 @@ int main(void) {
     edges += q->phrase ? q->n : 0;
     p = e + 1;
   }
+  free(qb);
+  rehash();
 
   // The phrase automaton: a trie of the phrases' term sequences (identical
   // phrases share an end node), then failure links in order of depth.
   uint32_t gsz = 1;
-  while (gsz < 2 * edges)
+  while (gsz < edges + edges / 2)
     gsz <<= 1;
   gmask = gsz - 1;
   gkey = malloc(gsz * 8ull), gval = malloc(gsz * 4ull);
@@ -561,7 +521,7 @@ int main(void) {
     if (q->phrase) {
       if (outp[s] == NONE)
         outp[s] = nids++;
-      q->t[0] = nterms + outp[s]; // from here on, the phrase's index id
+      q->t[0] = nterms + outp[s]; // from here on, the phrase's id
     }
   }
   uint32_t *bydepth = malloc(nnode * 4ull), *dep = calloc(nnode, 4), nb = 0;
@@ -592,97 +552,135 @@ int main(void) {
   }
   nids += nterms; // terms, then phrases
 
+  // A present slot for each id a query reads (a term only in phrases needs
+  // none), and the queries as one program: per query its input number, then
+  // n | lo << 8, then its n entries slot | op << OPS; qoff[q] is the first entry.
+  slot = malloc(nids * 4ull);
+  memset(slot, 0xff, nids * 4ull);
+  uint32_t plen = 0;
+  for (uint32_t i = 0; i < nq; i++)
+    plen += 2 + (qs[i].phrase ? 1 : qs[i].n);
+  prog = malloc(plen * 4ull), qoff = malloc(nq * 4ull);
+  uint32_t *w = prog;
+  for (uint32_t i = 0; i < nq; i++) {
+    Query *q = &qs[i];
+    uint32_t n = q->phrase ? 1 : q->n, lo = 0;
+    *w++ = i, *w++ = 0;
+    qoff[i] = w - prog;
+    for (uint32_t k = 0; k < n; k++) {
+      uint32_t id = q->t[k], op = k ? (q->op[k] == 'O' ? 1 : q->op[k] == 'N' ? 2 : 0) : 0;
+      if (slot[id] == NONE)
+        slot[id] = nslots++;
+      lo = op == 1 ? k : lo;
+      *w++ = slot[id] | op << OPS;
+    }
+    w[-1 - (int)n] = n | lo << 8;
+  }
+  for (uint32_t v = 0; v < nnode; v++)
+    outp[v] = outp[v] == NONE ? NONE : slot[nterms + outp[v]];
+  free(qs);
+
+  int fd = open("/data/docs.txt", O_RDONLY);
   struct stat st;
-  fd = open("/data/docs.txt", O_RDONLY);
   if (fd < 0 || fstat(fd, &st))
     die("cannot open /data/docs.txt");
-  long size = st.st_size;
-  // N is one more than the id of the last line.
-  if (size > 0) {
-    char c[4096];
-    long pos = size - 1, ls = 0;
-    while (pos > 0) {
-      long from = pos > (long)sizeof c ? pos - (long)sizeof c : 0;
-      if (pread(fd, c, pos - from, from) != pos - from)
-        die("read failed");
-      char *nl = memrchr(c, '\n', pos - from);
-      if (nl) {
-        ls = from + (nl - c) + 1;
-        break;
-      }
-      pos = from;
-    }
-    if (pread(fd, c, 24, ls) <= 0)
-      die("read failed");
-    N = strtoul(c, NULL, 10) + 1;
-  }
-  W = (N + 63) / 64;
-  bm = calloc(nids + 1, sizeof *bm);
+  long size = st.st_size, pg = sysconf(_SC_PAGESIZE), len = (size + pg - 1) / pg * pg + pg;
+  // The file over an anonymous zero mapping one page longer, so tokenize's
+  // reads past the last byte stay mapped.
+  char *base = mmap(NULL, len, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (base == MAP_FAILED || (size && mmap(base, size, PROT_READ, MAP_PRIVATE | MAP_FIXED, fd, 0) == MAP_FAILED))
+    die("cannot map /data/docs.txt");
+  if (size)
+    madvise(base, size, MADV_WILLNEED);
+  map = base;
 
   cpu_set_t cpus; // the CPUs this container may use, not the host's count
   nth = sched_getaffinity(0, sizeof cpus, &cpus) ? 1 : CPU_COUNT(&cpus);
   nth = nth < 1 ? 1 : nth > 64 ? 64 : nth;
   th = calloc(nth, sizeof(Th));
-  for (int i = 1; i < nth; i++) {
+  for (int i = 1; i < nth; i++) { // each range starts after a newline
     long b = size * i / nth;
-    if (b > 0) {
-      char c[256];
-      ssize_t n = pread(fd, c, sizeof c, b - 1);
-      char *nl = n > 0 ? memchr(c, '\n', n) : NULL;
-      while (!nl && n > 0) { // a long document: keep looking for its end
-        b += n;
-        n = pread(fd, c, sizeof c, b - 1);
-        nl = n > 0 ? memchr(c, '\n', n) : NULL;
-      }
-      b = nl ? b + (nl - c) : size;
+    if (b > 0 && map[b - 1] != '\n') {
+      const char *nl = memchr(map + b, '\n', size - b);
+      b = nl ? nl + 1 - map : size;
     }
     th[i].beg = b < th[i - 1].beg ? th[i - 1].beg : b;
     th[i - 1].end = th[i].beg;
   }
   th[nth - 1].end = size;
-  for (int i = nth - 1; i >= 0; i--) { // each range's first doc id, from its first line
-    char c[24] = {0};
-    uint32_t next = i + 1 < nth ? th[i + 1].first : N;
-    th[i].first = th[i].beg < size && pread(fd, c, 23, th[i].beg) > 0 ? strtoul(c, NULL, 10) : N;
-    th[i].wlo = th[i].first >> 6;
-    th[i].whi = (next ? next - 1 : 0) >> 6;
-    th[i].buf = malloc(BUFSZ + 64); // slack for tokenize's reads past the data
-    th[i].tokids = malloc((BUFSZ / 2 + 2) * 4ull); // a line has at most BUFSZ / 2 tokens
-    th[i].tw = malloc((BUFSZ / 2 + 2) * 32ull);
-    th[i].tc = calloc(nids + 1, sizeof(Tc));
-  }
-  run_threads(scan);
-
-  // Posting slices for the list ids, each thread's cursor after earlier threads'.
-  df = calloc(nids + 1, 4);
-  pstart = calloc(nids + 1, 4);
-  uint32_t total = 0, maxlist = 0;
-  for (uint32_t t = 0; t < nids; t++) {
-    pstart[t] = total;
-    for (int i = 0; i < nth && !bm[t]; i++) {
-      uint32_t c = th[i].tc[t].cnt;
-      th[i].tc[t].cnt = total;
-      total += c;
-    }
-    df[t] = total - pstart[t];
-  }
-  post = malloc((size_t)total * 4 + 4);
-  run_threads(fill);
-  for (uint32_t t = 0; t < nids; t++) {
-    if (bm[t])
-      for (uint32_t w = 0; w < W; w++)
-        df[t] += __builtin_popcountll(bm[t][w]);
-    else
-      maxlist = df[t] > maxlist ? df[t] : maxlist;
-  }
-  lcap = (maxlist > N / 32 ? maxlist : N / 32) + 1;
   for (int i = 0; i < nth; i++) {
-    free(th[i].tc);
-    th[i].la = malloc(lcap * 4ull);
-    th[i].lb = malloc(lcap * 4ull);
-    th[i].bits = malloc(W * 8ull + 8);
+    th[i].present = calloc(nslots + 1, 8);
+    th[i].touched = malloc((nslots + 1) * 4ull);
+    th[i].tokids = malloc((CH / 2 + 2) * 4ull); // a chunk has at most CH / 2 + 1 tokens
+    th[i].tw = malloc((CH / 2 + 2) * 32ull);
+    th[i].qr = calloc(nq + 1, sizeof(Qs));
   }
-  run_threads(answer);
+  freq = calloc(nslots + 1, 4);
+  run_threads(sample);
+
+  // The program reordered by each query's first trigger, so the queries one
+  // slot triggers sit together, in the program and in each thread's qr. Each
+  // query's header gains nt << 16, and its nt triggers follow its entries.
+  uint32_t *at = calloc(nslots + 1, 4), *qoff2 = malloc(nq * 4ull), *ord = malloc(nq * 4ull);
+  for (uint32_t i = 0; i < nq; i++) {
+    uint32_t ts[MAXT];
+    plen += triggers(i, ts);
+    qoff2[i] = ts[0];
+    at[ts[0] + 1]++;
+  }
+  for (uint32_t s = 1; s < nslots; s++)
+    at[s] += at[s - 1];
+  for (uint32_t i = 0; i < nq; i++)
+    ord[at[qoff2[i]]++] = i;
+  uint32_t *prog2 = malloc(plen * 4ull);
+  w = prog2;
+  for (uint32_t j = 0; j < nq; j++) {
+    const uint32_t *e = prog + qoff[ord[j]] - 2;
+    uint32_t n = 2 + (e[1] & 0xff), nt = triggers(ord[j], w + n);
+    memcpy(w, e, n * 4ull);
+    w[1] |= nt << 16;
+    qoff2[j] = w + 2 - prog2;
+    w += n + nt;
+  }
+  free(prog), free(qoff), free(at), free(ord);
+  prog = prog2, qoff = qoff2;
+
+  // Each query under the slots of its cheapest trigger set, by counting then placing.
+  toff = calloc(nslots + 2, 4);
+  for (int pass = 0; pass < 2; pass++) {
+    for (uint32_t i = 0; i < nq; i++) {
+      uint32_t ts[MAXT], n = triggers(i, ts);
+      for (uint32_t k = 0; k < n; k++)
+        if (pass)
+          trig[toff[ts[k] + 1]++] = i;
+        else
+          toff[ts[k] + 2]++;
+    }
+    if (!pass) {
+      for (uint32_t s = 2; s < nslots + 2; s++)
+        toff[s] += toff[s - 1];
+      trig = malloc((toff[nslots + 1] + 1) * 4ull);
+    }
+  }
+  free(freq);
+  run_threads(scan);
+  for (int i = 0; i < nth; i++)
+    free(th[i].present), free(th[i].touched), free(th[i].tokids), free(th[i].tw);
+  res = calloc(nq + 1, sizeof(Result));
+
+  // Counts and sums add up; the first ten ids come from the threads in order,
+  // since each holds a run of ascending ids and logged its first ten in order.
+  for (int i = 0; i < nth; i++) {
+    for (uint32_t q = 0; q < nq; q++) {
+      Result *r = &res[prog[qoff[q] - 2]];
+      r->count += th[i].qr[q].cnt, r->sum += th[i].qr[q].sum;
+    }
+    for (size_t j = 0; j < th[i].nlog; j++) {
+      Result *r = &res[th[i].log[j] >> 32];
+      if (r->m < 10)
+        r->ids[r->m++] = (uint32_t)th[i].log[j];
+    }
+  }
 
   int out = open("/out/results.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
   if (out < 0)
