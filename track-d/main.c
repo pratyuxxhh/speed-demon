@@ -2,16 +2,20 @@
 // query in a directed graph with non-negative uint32 weights. See
 // specs/d-traverse.md.
 //
-// The graph is read by all threads in two passes into a CSR (out-degrees, then
-// edges at atomically advanced cursors); self-loops are dropped, since they never
-// shorten a path. The nodes are renumbered in breadth-first order for locality.
+// graph.txt is mapped and read by all threads three times, 32 lines at a time
+// with the node entries they touch prefetched: out-degrees, then the heads in a
+// CSR, then (after renumbering) the edges packed into 4 bytes at their final
+// place. Self-loops are dropped: they never shorten a path. The nodes are
+// renumbered by BFS regions that all threads grow at once, so nodes near each
+// other in the network are near in memory (the input ids are shuffled).
 // Queries run in parallel, each a Dijkstra search from s that stops when t is
-// settled, with Dial's bucket queue and 32-bit distances. A query whose target has
-// no in-edges, or whose source has no out-edges, is answered -1 without
-// searching. A search that meets a weight of RING or more, or would reach
-// 2^32 - 1, is redone with a binary heap and 64-bit distances.
+// settled, with Dial's bucket queue and 64-bit distances. A search keeps no
+// distance per node: a node is pushed whenever it is reached and settled, one
+// bit, at its first pop. A query whose target has no in-edges, or whose source
+// has no out-edges, is answered -1 without searching.
 #define _GNU_SOURCE
 #include <fcntl.h>
+#include <malloc.h>
 #include <pthread.h>
 #include <sched.h>
 #include <stdint.h>
@@ -19,59 +23,79 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
-#define BUFSZ (1 << 16)
 #define INF32 UINT32_MAX
+#define ESC 0xFFFF // the packed weight that marks an escaped edge
+#define RING 4096  // Dial's buckets; a power of two above every main-body weight
 
-typedef struct {
-  uint32_t v, w;
-} Edge;
 typedef struct {
   uint32_t e, v, w; // an edge the packed form cannot hold: its index, head, weight
 } Esc;
-#define ESC 0xFFFF // packed weight field that marks an escaped edge
 typedef struct {
-  uint64_t d;
+  uint64_t d; // a node pending beyond the ring, at distance d
   uint32_t u;
-} Item;
-#define RING 4096 // Dial's buckets; a power of two above every main-body weight
+} Far;
 typedef struct {
   uint32_t *v, n, cap;
 } Bucket;
 typedef struct {
-  long beg, end;
-  char *buf;
-  uint32_t *d32, *touched; // dial()'s distances, reset through the touched list
-  uint64_t *d64;           // search()'s, complemented (0: unreached), mapped on demand
-  Item *heap;
+  const char *beg, *end; // this thread's lines of graph.txt
+  uint64_t *done;        // the nodes a search has settled, one bit each
+  uint32_t lo, hi;       // the words of done that a search wrote
+  uint32_t *list, nl, base, nfar, farcap; // list: the nodes this thread's BFS claimed
+  Far *far;
   Esc *esc;
-  size_t hcap, tcap, nesc, esccap;
+  size_t nesc, esccap;
   Bucket ring[RING];
 } Th;
 
-static int fd, nth, pass, next_q;
+static int nth, pass, next_q;
 static Th *th;
-static uint32_t n, nq, *off, *cur, *qs, *qt;
-static uint8_t *has_in, *has_in2;
-static Edge *edges;
-// After renumbering, edge e of node u is pk[e]: a 16-bit head delta (head - u) and
-// a 16-bit weight, or ESC with the edge in esc[], sorted by e.
+static uint32_t n, nq, *off, *cur, *qs, *qt, *adj, *perm;
+static uint8_t *has_in;
+// After renumbering, edge e of node u is pk[e]: a 16-bit head delta (head - u)
+// and a 16-bit weight, or ESC with the edge in esc[], sorted by e.
 static uint32_t *pk;
 static Esc *esc;
 static size_t nesc;
 static int64_t *ans;
-static uint32_t *order, *perm, *off2; // renumbering: new -> old, old -> new, new offsets
 
 static void die(const char *m) {
   fprintf(stderr, "%s\n", m);
   exit(1);
 }
 
-// Pass 1 counts each tail's out-edges; pass 2 stores the edges.
-static void edge_lines(const char *p, const char *lim) {
-  while (p < lim) {
+// Pass 3: edge u -> v of weight w, in the new numbering, at u's next cursor;
+// its head gains an in-edge.
+static void put(Th *t, uint32_t u, uint32_t v, uint32_t w) {
+  uint32_t k = __atomic_fetch_add(&cur[u], 1, __ATOMIC_RELAXED);
+  int64_t dv = (int64_t)v - u;
+  __atomic_store_n(&has_in[v], 1, __ATOMIC_RELAXED);
+  if (dv >= INT16_MIN && dv <= INT16_MAX && w < ESC) {
+    pk[k] = (uint32_t)(uint16_t)dv << 16 | w;
+    return;
+  }
+  if (t->nesc == t->esccap)
+    t->esc = realloc(t->esc, (t->esccap = t->esccap ? 2 * t->esccap : 256) * sizeof(Esc));
+  t->esc[t->nesc++] = (Esc){k, v, w};
+  pk[k] = ESC;
+}
+
+// This thread's lines: pass 1 counts each tail's out-edges; pass 2 stores their
+// heads; pass 3, once the nodes are renumbered, stores the edges packed. Lines
+// are parsed 32 at a time and the node entries they will touch prefetched
+// first, so the cache misses of the shuffled ids overlap (pass 3 does it again
+// after renumbering).
+static void *scan(void *arg) {
+  Th *t = arg;
+  const char *p = t->beg;
+  uint32_t a[3][32], m = 0;
+  if (pass == 1) // the pages in one call, not a fault each
+    madvise((void *)((uintptr_t)p & ~4095ul), t->end - p + 4096, 22); // POPULATE_READ
+  while (p < t->end) {
     uint32_t u = 0, v = 0;
     uint64_t w = 0;
     for (; *p != ' '; p++)
@@ -81,61 +105,28 @@ static void edge_lines(const char *p, const char *lim) {
     for (p++; *p != '\n'; p++)
       w = w * 10 + (*p - '0');
     p++;
-    if (u == v || u >= n || v >= n)
-      continue; // a self-loop never shortens a path
-    if (pass == 1) {
-      __atomic_fetch_add(&off[u + 1], 1, __ATOMIC_RELAXED);
-      __atomic_store_n(&has_in[v], 1, __ATOMIC_RELAXED);
-    } else {
-      edges[__atomic_fetch_add(&cur[u], 1, __ATOMIC_RELAXED)] = (Edge){v, (uint32_t)w};
+    if (u != v && u < n && v < n) { // a self-loop never shortens a path
+      a[0][m] = u, a[1][m] = v, a[2][m++] = w;
+      __builtin_prefetch(pass == 1 ? &off[u + 1] : pass == 2 ? &cur[u] : &perm[u], 1);
+      if (pass == 3)
+        __builtin_prefetch(&perm[v]);
     }
-  }
-}
-
-static void *scan(void *arg) {
-  Th *t = arg;
-  size_t have = 0;
-  for (long o = t->beg; o < t->end;) {
-    long want = t->end - o < (long)(BUFSZ - have) ? t->end - o : (long)(BUFSZ - have);
-    ssize_t k = pread(fd, t->buf + have, want, o);
-    if (k <= 0)
-      die("read failed");
-    o += k;
-    have += k;
-    char *last = memrchr(t->buf, '\n', have);
-    if (!last)
+    if (m < 32 && p < t->end)
       continue;
-    edge_lines(t->buf, last + 1);
-    have -= last + 1 - t->buf;
-    memmove(t->buf, last + 1, have);
+    for (uint32_t i = 0; pass == 3 && i < m; i++) {
+      a[0][i] = perm[a[0][i]], a[1][i] = perm[a[1][i]];
+      __builtin_prefetch(&cur[a[0][i]], 1), __builtin_prefetch(&has_in[a[1][i]], 1);
+    }
+    for (uint32_t i = 0; i < m; i++)
+      if (pass == 1)
+        __atomic_fetch_add(&off[a[0][i] + 1], 1, __ATOMIC_RELAXED);
+      else if (pass == 2)
+        adj[__atomic_fetch_add(&cur[a[0][i]], 1, __ATOMIC_RELAXED)] = a[1][i];
+      else
+        put(t, a[0][i], a[1][i], a[2][i]);
+    m = 0;
   }
   return NULL;
-}
-
-static void push(Th *t, size_t *hn, uint64_t d, uint32_t u) {
-  if (*hn == t->hcap) {
-    t->hcap *= 2;
-    t->heap = realloc(t->heap, t->hcap * sizeof(Item));
-  }
-  size_t i = (*hn)++;
-  for (; i && t->heap[(i - 1) / 2].d > d; i = (i - 1) / 2)
-    t->heap[i] = t->heap[(i - 1) / 2];
-  t->heap[i] = (Item){d, u};
-}
-
-static Item pop(Th *t, size_t *hn) {
-  Item top = t->heap[0], last = t->heap[--*hn];
-  size_t i = 0;
-  for (size_t c; (c = 2 * i + 1) < *hn; i = c) {
-    if (c + 1 < *hn && t->heap[c + 1].d < t->heap[c].d)
-      c++;
-    if (t->heap[c].d >= last.d)
-      break;
-    t->heap[i] = t->heap[c];
-  }
-  if (*hn)
-    t->heap[i] = last;
-  return top;
 }
 
 // Edge e of node u, from its packed form or the escape table.
@@ -153,155 +144,130 @@ static void edge_at(uint32_t u, uint32_t e, uint32_t *v, uint32_t *w) {
   *v = esc[lo].v, *w = esc[lo].w;
 }
 
-// search()'s array holds the complement of each distance, so a page the kernel
-// hands out zeroed reads as "unreached", and its pages are returned after each
-// of the few searches that need it.
-static void *dist_array(size_t bytes) {
-  void *a = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
-  if (a == MAP_FAILED)
-    die("out of memory");
-  return a;
-}
+static int is_done(const Th *t, uint32_t u) { return t->done[u >> 6] >> (u & 63) & 1; }
 
-// Dijkstra with a binary heap and 64-bit distances, from s until t is settled:
-// the distance, or -1 when t is unreachable. Used when dial() cannot be.
-static int64_t search(Th *t, uint32_t s, uint32_t tg) {
-  size_t hn = 0;
-  int64_t res = -1;
-  if (!t->d64)
-    t->d64 = dist_array(n * 8ull);
-  t->d64[s] = ~0ull;
-  push(t, &hn, 0, s);
-  while (hn) {
-    Item it = pop(t, &hn);
-    if (it.d > ~t->d64[it.u])
-      continue; // stale: u was settled at a shorter distance
-    if (it.u == tg) {
-      res = it.d;
-      break;
-    }
-    for (uint32_t e = off[it.u]; e < off[it.u + 1]; e++) {
-      uint32_t v, w;
-      edge_at(it.u, e, &v, &w);
-      uint64_t nd = it.d + w;
-      if (nd < ~t->d64[v]) {
-        t->d64[v] = ~nd;
-        push(t, &hn, nd, v);
-      }
-    }
-  }
-  madvise(t->d64, n * 8ull, MADV_DONTNEED);
-  return res;
+// Settle u: false if it already was. lo and hi bound the words written, which
+// the breadth-first numbering keeps to a narrow span, so clearing them is cheap.
+static int settle(Th *t, uint32_t u) {
+  if (is_done(t, u))
+    return 0;
+  t->done[u >> 6] |= 1ull << (u & 63);
+  t->lo = u >> 6 < t->lo ? u >> 6 : t->lo, t->hi = u >> 6 > t->hi ? u >> 6 : t->hi;
+  return 1;
 }
 
 static void bpush(Bucket *b, uint32_t v) {
   if (b->n == b->cap)
-    b->v = realloc(b->v, (b->cap = b->cap ? b->cap * 2 : 64) * 4ull);
+    b->v = realloc(b->v, (b->cap = b->cap ? b->cap * 2 : 8) * 4ull);
   b->v[b->n++] = v;
 }
 
-// Dijkstra with Dial's bucket queue: a ring of RING buckets holds every pending
-// distance in [d, d + RING), one distance per bucket, as long as no edge weighs
-// RING or more (main-body weights are at most a few thousand). Returns as
-// search() does, or -2 when such a weight or a 32-bit overflow is met.
+// Dijkstra from s until t is settled: the distance, or -1 when t is
+// unreachable. Dial's ring of RING buckets holds every pending distance in
+// [d, d + RING), one distance per bucket. An edge of RING or more (only the
+// rare ones near 2^32; main-body weights are a few thousand at most) sends its
+// head to the far list instead, which joins the ring once d comes within RING
+// of it; d jumps to the nearest far node when the ring is empty.
 static int64_t dial(Th *t, uint32_t s, uint32_t tg) {
-  size_t live = 1, nt = 0;
+  size_t inring = 1;
   int64_t res = -1;
-  t->d32[s] = 0;
-  t->touched[nt++] = s;
   bpush(&t->ring[0], s);
-  for (uint32_t d = 0; live && res == -1; d++) {
+  for (uint64_t d = 0; (inring || t->nfar) && res == -1; d++) {
+    for (uint32_t i = 0; !inring && i < t->nfar; i++)
+      d = i && d < t->far[i].d ? d : t->far[i].d;
+    for (uint32_t i = 0; i < t->nfar;)
+      if (t->far[i].d < d + RING)
+        bpush(&t->ring[t->far[i].d & (RING - 1)], t->far[i].u), inring++,
+            t->far[i] = t->far[--t->nfar];
+      else
+        i++;
     Bucket *b = &t->ring[d & (RING - 1)];
     for (uint32_t k = 0; k < b->n && res == -1; k++) { // weight-0 edges add to this bucket
       uint32_t u = b->v[k];
-      live--;
-      if (t->d32[u] != d)
-        continue; // stale: u was settled at a shorter distance
+      inring--;
+      if (!settle(t, u))
+        continue; // already settled, at a shorter distance
       if (u == tg)
         res = d;
-      for (uint32_t e = off[u]; e < off[u + 1] && res == -1; e++) {
-        uint32_t v, w;
+      for (uint32_t e = off[u], v, w; e < off[u + 1] && res == -1; e++) {
         edge_at(u, e, &v, &w);
-        uint64_t nd = (uint64_t)d + w;
-        if (w >= RING || nd >= INF32)
-          res = -2;
-        else if (nd < t->d32[v]) {
-          if (t->d32[v] == INF32) {
-            if (nt == t->tcap)
-              t->touched = realloc(t->touched, (t->tcap *= 2) * 4);
-            t->touched[nt++] = v;
-          }
-          t->d32[v] = nd;
-          bpush(&t->ring[nd & (RING - 1)], v);
-          live++;
-        }
+        if (is_done(t, v))
+          continue;
+        if (w < RING)
+          bpush(&t->ring[(d + w) & (RING - 1)], v), inring++;
+        else if (t->nfar < t->farcap || (t->far = realloc(t->far, (t->farcap += 16) * sizeof(Far))))
+          t->far[t->nfar++] = (Far){d + w, v};
       }
     }
     b->n = 0;
   }
   for (int i = 0; i < RING; i++)
     t->ring[i].n = 0;
-  for (size_t i = 0; i < nt; i++) // reset only what this search touched
-    t->d32[t->touched[i]] = INF32;
+  memset(t->done + t->lo, 0, (t->hi - t->lo + 1) * 8ull), t->lo = n, t->hi = 0, t->nfar = 0;
   return res;
 }
 
 static void *answer(void *arg) {
   Th *t = arg;
-  t->d32 = malloc(n * 4ull);
-  memset(t->d32, 0xff, n * 4ull);
-  t->tcap = 1 << 16;
-  t->touched = malloc(t->tcap * 4);
-  t->hcap = 1 << 16;
-  t->heap = malloc(t->hcap * sizeof(Item));
+  t->done = calloc(n / 64 + 1, 8), t->lo = n, t->hi = 0; // a search settles s at least
   for (uint32_t q; (q = __atomic_fetch_add(&next_q, 1, __ATOMIC_RELAXED)) < nq;) {
     uint32_t s = qs[q], tg = qt[q];
     if (s == tg)
       ans[q] = 0;
     else if (!has_in[tg] || off[s] == off[s + 1])
       ans[q] = -1; // nothing enters t, or nothing leaves s
-    else if ((ans[q] = dial(t, s, tg)) == -2)
-      ans[q] = search(t, s, tg);
+    else
+      ans[q] = dial(t, s, tg);
   }
   return NULL;
 }
 
-// Thread k's share of the new ids: [n * k / nth, n * (k + 1) / nth).
-static void share(Th *t, uint32_t *lo, uint32_t *hi) {
-  *lo = (uint64_t)n * (t - th) / nth, *hi = (uint64_t)n * (t - th + 1) / nth;
+// Claim v for the renumbering: false if another BFS already has it.
+static int claim(uint32_t v) {
+  uint32_t x = INF32;
+  return perm[v] == INF32 &&
+         __atomic_compare_exchange_n(&perm[v], &x, 0, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
 }
 
-static void *degrees(void *arg) {
-  uint32_t lo, hi;
-  share(arg, &lo, &hi);
-  for (uint32_t i = lo; i < hi; i++)
-    off2[i + 1] = off[order[i] + 1] - off[order[i]];
-  return NULL;
-}
-
-// The packed edges of this thread's share of the new ids. Its escapes come out
-// sorted by edge index, and the shares are in order.
-static void *remap(void *arg) {
+// One thread's regions of the renumbering: a BFS from each node of its share of
+// the old ids that no thread has claimed yet, listing what it claims in BFS
+// order. The queue prefetches ahead: the offsets, edges and marks of the nodes
+// it is about to expand are random reads in the input numbering.
+static void *bfs(void *arg) {
   Th *t = arg;
-  uint32_t lo, hi;
-  share(t, &lo, &hi);
-  for (uint32_t i = lo; i < hi; i++) {
-    uint32_t u = order[i], k = off2[i];
-    for (uint32_t e = off[u]; e < off[u + 1]; e++, k++) {
-      uint32_t v = perm[edges[e].v], w = edges[e].w;
-      int64_t dv = (int64_t)v - i;
-      if (dv >= INT16_MIN && dv <= INT16_MAX && w < ESC) {
-        pk[k] = (uint32_t)(uint16_t)dv << 16 | w;
-        continue;
-      }
-      if (t->nesc == t->esccap)
-        t->esc = realloc(t->esc, (t->esccap = t->esccap ? 2 * t->esccap : 256) * sizeof(Esc));
-      t->esc[t->nesc++] = (Esc){k, v, w};
-      pk[k] = ESC;
+  uint32_t *q = t->list = malloc(n * 4ull), tl = 0; // only the pages written count
+  for (uint32_t r = (uint64_t)n * (t - th) / nth; r < (uint64_t)n * (t - th + 1) / nth; r++) {
+    if (!claim(r))
+      continue;
+    q[tl++] = r;
+    for (uint32_t h = tl - 1; h < tl; h++) {
+      if (h + 16 < tl)
+        __builtin_prefetch(&off[q[h + 16]]);
+      if (h + 8 < tl)
+        __builtin_prefetch(&adj[off[q[h + 8]]]);
+      for (uint32_t e = h + 4 < tl ? off[q[h + 4]] : 0; h + 4 < tl && e < off[q[h + 4] + 1]; e++)
+        __builtin_prefetch(&perm[adj[e]]);
+      for (uint32_t e = off[q[h]]; e < off[q[h] + 1]; e++)
+        if (claim(adj[e]))
+          q[tl++] = adj[e];
     }
-    has_in2[i] = has_in[u];
   }
+  t->nl = tl;
   return NULL;
+}
+
+// Each thread's nodes take consecutive new ids from base; their degrees go to
+// cur, which becomes the new offsets.
+static void *number(void *arg) {
+  Th *t = arg;
+  for (uint32_t j = 0; j < t->nl; j++)
+    perm[t->list[j]] = t->base + j, cur[t->base + j + 1] = off[t->list[j] + 1] - off[t->list[j]];
+  free(t->list);
+  return NULL;
+}
+
+static int by_index(const void *a, const void *b) {
+  return (((const Esc *)a)->e > ((const Esc *)b)->e) - (((const Esc *)a)->e < ((const Esc *)b)->e);
 }
 
 static void run_threads(void *(*f)(void *)) {
@@ -314,6 +280,8 @@ static void run_threads(void *(*f)(void *)) {
 }
 
 int main(void) {
+  prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0); // 2 MB pages would be charged whole
+  mallopt(M_MMAP_THRESHOLD, 1 << 17);    // big blocks go back when freed
   // queries.txt: "s t" per line.
   FILE *qf = fopen("/data/queries.txt", "r");
   if (!qf)
@@ -321,104 +289,67 @@ int main(void) {
   size_t qcap = 1024;
   qs = malloc(qcap * 4), qt = malloc(qcap * 4);
   for (uint32_t s, t; fscanf(qf, "%u %u", &s, &t) == 2; nq++) {
-    if (nq == qcap) {
-      qcap *= 2;
-      qs = realloc(qs, qcap * 4), qt = realloc(qt, qcap * 4);
-    }
+    if (nq == qcap)
+      qcap *= 2, qs = realloc(qs, qcap * 4), qt = realloc(qt, qcap * 4);
     qs[nq] = s, qt[nq] = t;
   }
   fclose(qf);
 
+  // graph.txt: "n m" then "u v w" lines, each thread a line-aligned share.
   struct stat st;
-  fd = open("/data/graph.txt", O_RDONLY);
-  if (fd < 0 || fstat(fd, &st))
-    die("cannot open /data/graph.txt");
-  long size = st.st_size, body;
-  {
-    char c[64];
-    ssize_t k = pread(fd, c, sizeof c - 1, 0);
-    c[k > 0 ? k : 0] = 0;
-    n = strtoul(c, NULL, 10);
-    char *nl = strchr(c, '\n');
-    if (!nl)
-      die("bad graph.txt header");
-    body = nl - c + 1;
-  }
+  int fd = open("/data/graph.txt", O_RDONLY);
+  const char *g = fd < 0 || fstat(fd, &st) ? MAP_FAILED : mmap(NULL, st.st_size + 1, PROT_READ, MAP_PRIVATE, fd, 0);
+  if (g == MAP_FAILED || !(n = strtoul(g, NULL, 10)))
+    die("cannot read /data/graph.txt");
+  const char *end = g + st.st_size, *body = (const char *)memchr(g, '\n', st.st_size) + 1;
   for (uint32_t i = 0; i < nq; i++)
     if (qs[i] >= n || qt[i] >= n)
       die("query node out of range");
-  off = calloc(n + 2, 4);
-  has_in = calloc(n + 1, 1);
-
   cpu_set_t cpus; // the CPUs this container may use, not the host's count
   nth = sched_getaffinity(0, sizeof cpus, &cpus) ? 1 : CPU_COUNT(&cpus);
   nth = nth < 1 ? 1 : nth > 64 ? 64 : nth;
   th = calloc(nth, sizeof(Th));
-  th[0].beg = body;
-  for (int i = 1; i < nth; i++) {
-    long b = body + (size - body) * i / nth;
-    char c[64];
-    ssize_t k = pread(fd, c, sizeof c, b - 1);
-    char *nl = k > 0 ? memchr(c, '\n', k) : NULL; // lines are at most 33 bytes
-    b = nl ? b + (nl - c) : size;
-    th[i].beg = b < th[i - 1].beg ? th[i - 1].beg : b;
-    th[i - 1].end = th[i].beg;
+  for (int i = 0; i < nth; i++) {
+    const char *b = body + (end - body) * i / nth;
+    th[i].beg = i ? (const char *)memchr(b - 1, '\n', end - b + 1) + 1 : body;
+    th[i].beg = i && th[i].beg < th[i - 1].beg ? th[i - 1].beg : th[i].beg;
+    th[i - !!i].end = th[i].beg, th[i].end = end;
   }
-  th[nth - 1].end = size;
-  for (int i = 0; i < nth; i++)
-    th[i].buf = malloc(BUFSZ);
+
+  // The CSR of heads: degrees, offsets, then the heads with off[u] as u's
+  // cursor; after it each off[u] has reached off[u + 1], so they move up one.
+  off = calloc(n + 2, 4);
   pass = 1;
   run_threads(scan);
   for (uint32_t u = 0; u < n; u++)
     off[u + 1] += off[u];
-  edges = malloc((off[n] + 1ull) * sizeof(Edge));
-  cur = malloc((n + 1) * 4ull);
-  memcpy(cur, off, (n + 1) * 4ull);
-  pass = 2;
+  adj = malloc((off[n] + 1ull) * 4), cur = off, pass = 2;
   run_threads(scan);
-  free(cur);
-  for (int i = 0; i < nth; i++)
-    free(th[i].buf);
-
-  // Renumber the nodes in breadth-first order, so that nodes near each other in
-  // the network are near each other in memory (the input ids are shuffled).
-  // The BFS prefetches ahead in its queue: the offsets, edges and marks of the
-  // nodes it is about to expand are random reads in the input numbering.
-  order = malloc(n * 4ull), perm = malloc(n * 4ull);
-  uint32_t tail = 0;
-  memset(perm, 0xff, n * 4ull);
-  for (uint32_t r = 0; r < n; r++) {
-    if (perm[r] != INF32)
-      continue;
-    perm[r] = tail, order[tail++] = r;
-    for (uint32_t h = tail - 1; h < tail; h++) {
-      if (h + 16 < tail)
-        __builtin_prefetch(&off[order[h + 16]]);
-      if (h + 8 < tail)
-        __builtin_prefetch(&edges[off[order[h + 8]]]);
-      for (uint32_t e = h + 4 < tail ? off[order[h + 4]] : 0; h + 4 < tail && e < off[order[h + 4] + 1]; e++)
-        __builtin_prefetch(&perm[edges[e].v]);
-      for (uint32_t e = off[order[h]]; e < off[order[h] + 1]; e++)
-        if (perm[edges[e].v] == INF32)
-          perm[edges[e].v] = tail, order[tail++] = edges[e].v;
-    }
-  }
-  // The graph in the new numbering, built in parallel: degrees, offsets, edges.
-  off2 = malloc((n + 2) * 4ull), pk = malloc((off[n] + 1ull) * 4);
-  has_in2 = malloc(n + 1ull);
-  off2[0] = 0;
-  run_threads(degrees);
+  memmove(off + 1, off, n * 4ull), off[0] = 0;
+  // Renumber in BFS regions, each a block of new ids; the new offsets come from
+  // the old degrees. Then a third read of graph.txt writes the packed edges
+  // straight into place, so only one copy of the edges ever exists; again the
+  // offsets are the cursors.
+  perm = malloc(n * 4ull), memset(perm, 0xff, n * 4ull);
+  run_threads(bfs);
+  free(adj);
+  for (int i = 0, b = 0; i < nth; b += th[i].nl, i++)
+    th[i].base = b;
+  cur = calloc(n + 2, 4);
+  run_threads(number);
   for (uint32_t i = 0; i < n; i++)
-    off2[i + 1] += off2[i];
-  run_threads(remap);
-  free(edges), free(off), free(has_in), free(order);
-  off = off2, has_in = has_in2;
+    cur[i + 1] += cur[i];
+  free(off), off = cur;
+  pk = malloc((off[n] + 1ull) * 4), has_in = calloc(n + 1, 1), pass = 3;
+  run_threads(scan);
+  memmove(off + 1, off, n * 4ull), off[0] = 0;
   for (int i = 0; i < nth; i++)
     nesc += th[i].nesc;
   esc = malloc((nesc + 1) * sizeof(Esc));
-  for (int i = 0, k = 0; i < nth; k += th[i].nesc, i++)
+  for (int i = 0, j = 0; i < nth; j += th[i].nesc, i++)
     if (th[i].nesc)
-      memcpy(esc + k, th[i].esc, th[i].nesc * sizeof(Esc));
+      memcpy(esc + j, th[i].esc, th[i].nesc * sizeof(Esc));
+  qsort(esc, nesc, sizeof(Esc), by_index); // the threads wrote them in no order
   for (uint32_t i = 0; i < nq; i++)
     qs[i] = perm[qs[i]], qt[i] = perm[qt[i]];
   free(perm);
