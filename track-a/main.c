@@ -3,9 +3,10 @@
 //
 // One pass over the text: requests.log is mapped read-only and cut into 1 MB
 // chunks that threads take from a counter. Each line's endpoint is interned in
-// one shared lock-free table, and its latency (u32) and tag (endpoint id | 5xx
-// bit, u16) are appended to the thread's bucket for that hour. Then threads take
-// whole hours: gather the hour's records from every thread, group them by
+// one shared lock-free table, and a record (a u16 tag of endpoint id, latency
+// length and 5xx bit, then the latency in 1 to 4 bytes) goes to the thread's
+// bucket for that hour. Then threads take whole hours: gather the hour's
+// records from every thread, group them by
 // endpoint, select p50/p95/p99 and format the hour's lines. Whoever holds the
 // writer lock writes every finished hour in order, so the file sees one ordered
 // stream and no thread waits for another's hour.
@@ -29,8 +30,8 @@
 #define ERRBIT 0x8000
 
 typedef struct {
-  uint32_t *lat, n, cap;
-  uint16_t *tag;
+  uint8_t *buf; // records: a u16 tag (id | (latency bytes - 1) << 12 | 5xx << 15), then the latency
+  size_t n, cap; // in bytes
 } Bucket;
 typedef struct {
   uint32_t off, len; // the endpoint is arena[off..off+len)
@@ -129,19 +130,18 @@ static void parse(Th *t, const char *p, const char *hi) {
                      : m1 == 'O' ? 4
                                  : 5); // PUT, POST, PATCH
     const char *e = next_space(s);
-    uint16_t tag = ep_id(s, e - s) | (e[1] == '5' ? ERRBIT : 0);
     uint32_t lat = 0;
     for (p = e + 5; *p != '\n'; p++)
       lat = lat * 10 + (*p - '0');
     p++;
+    uint32_t len = lat < 1u << 8 ? 0 : lat < 1u << 16 ? 1 : lat < 1u << 24 ? 2 : 3; // bytes - 1
+    uint16_t tag = ep_id(s, e - s) | len << 12 | (e[1] == '5' ? ERRBIT : 0);
     Bucket *b = &t->b[hr];
-    if (b->n == b->cap) {
-      b->cap = b->cap ? b->cap * 2 : 4096;
-      b->lat = realloc(b->lat, b->cap * 4ull);
-      b->tag = realloc(b->tag, b->cap * 2ull);
-    }
-    b->lat[b->n] = lat;
-    b->tag[b->n++] = tag;
+    if (b->cap - b->n < 6) // room for the tag and a full 4-byte write
+      b->buf = realloc(b->buf, b->cap = b->cap ? b->cap * 2 : 16384);
+    memcpy(b->buf + b->n, &tag, 2);
+    memcpy(b->buf + b->n + 2, &lat, 4);
+    b->n += 3 + len;
   }
 }
 
@@ -225,11 +225,13 @@ static void *hours(void *arg) {
     memset(t->err, 0, E * 4);
     for (int i = 0; i < nth; i++) {
       Bucket *b = &th[i].b[hr];
-      for (uint32_t k = 0; k < b->n; k++) {
-        t->cnt[b->tag[k] & (CAP - 1)]++;
-        t->err[b->tag[k] & (CAP - 1)] += b->tag[k] >> 15;
+      for (size_t k = 0; k < b->n; n++) {
+        uint16_t tag;
+        memcpy(&tag, b->buf + k, 2);
+        t->cnt[tag & (CAP - 1)]++;
+        t->err[tag & (CAP - 1)] += tag >> 15;
+        k += 3 + (tag >> 12 & 3);
       }
-      n += b->n;
     }
     if (n > t->lcap)
       t->lats = realloc(t->lats, (t->lcap = n) * 4ull);
@@ -237,8 +239,14 @@ static void *hours(void *arg) {
       t->pos[id] = at, at += t->cnt[id];
     for (int i = 0; i < nth; i++) {
       Bucket *b = &th[i].b[hr];
-      for (uint32_t k = 0; k < b->n; k++)
-        t->lats[t->pos[b->tag[k] & (CAP - 1)]++] = b->lat[k];
+      for (size_t k = 0; k < b->n;) {
+        uint16_t tag;
+        uint32_t lat;
+        memcpy(&tag, b->buf + k, 2);
+        memcpy(&lat, b->buf + k + 2, 4); // 4 bytes were always written; keep the record's
+        t->lats[t->pos[tag & (CAP - 1)]++] = lat & 0xFFFFFFFFu >> (8 * (3 - (tag >> 12 & 3)));
+        k += 3 + (tag >> 12 & 3);
+      }
     }
     if (!t->out) { // a line is at most 21 + 125 + 57 + 1 = 204 bytes
       pthread_mutex_lock(&smu);

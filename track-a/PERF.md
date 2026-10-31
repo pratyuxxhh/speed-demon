@@ -8,7 +8,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 1 | C rewrite: 2-pass threaded scan, flat group array, quickselect | _not pushed yet_ | | | |
 | 2 | Memory cuts: small buffers, in-place percentiles, no per-thread error arrays, affinity-based thread count | _not pushed yet_ | | | |
 | 3 | -O3 -march=x86-64-v3, AVX2 endpoint scan, word hash, method length from 2 letters, bands removed (commit `d8af656`) | _fill in from the board_ | | | |
-| 4 | One parse pass into per-hour buckets, shared lock-free endpoint table, per-hour parallel finish with an ordered writer, mmap, 1 MB chunks from a counter | _not pushed yet_ | | | |
+| 4 | One parse pass into per-hour buckets, shared lock-free endpoint table, per-hour parallel finish with an ordered writer, mmap, 1 MB chunks from a counter | _fill in from the board_ | | | |
+| 5 | Variable-length latency records in the hour buckets (2-byte tag + 1–4 latency bytes) | _fill in from the board_ | | | |
 
 The board columns are filled from board runs only. Until a push is measured, the local numbers below are what we have.
 
@@ -53,8 +54,76 @@ That is 116x by the monotonic clock. The machine was busier during this second s
 | 3, session 4 (A/B) | 3831/32 = 120 → 10.94 | 67.9/13.4 = 5.06 → 1.38 | 318 → 0.771 | 1 → 1 | 11.7 | 53 |
 | 4, session 4 (A/B, 11 runs) | 3831/29 = 132 → 11.49 | 67.9/16.2 = 4.20 → 1.33 | 283 → 0.784 | 1 → 1 | 12.0 | 54 |
 | 4, session 4 (2 × 15 runs) | 3831/25 = 153 → 12.38 | 67.9/16.2 = 4.20 → 1.33 | 283 → 0.784 | 1 → 1 | 12.9 | 56 |
+| 4, **full**, step-5 session (A/B, 11 runs; S after clang-format) | 45342/60 = 756 → 27.49 | 232.4/44.2 = 5.25 → 1.39 | 299 → 0.778 | 1 → 1 | 29.8 | 74 |
+| 5, **full**, step-5 session (A/B, 11 runs; S after clang-format) | 45342/57 = 795 → 28.20 | 232.4/36.0 = 6.45 → 1.45 | 311 → 0.773 | 1 → 1 | 31.7 | 75 |
+| 5, **full**, using the 5-round mean time ratio (1.049 × step 4) | 45342/63 = 720 → 26.83 | 232.4/36.0 = 6.45 → 1.45 | 311 → 0.773 | 1 → 1 | 30.1 | 74 |
 
 Step 1 was measured unpinned (16 CPUs) and step 2 pinned to 12 CPUs. Unpinned, step 2 is 37 ms and 14.1 MB, which is still better than step 1 on both.
+
+## Step 5: full-scale experiments; variable-length latency records
+
+All numbers in this section are **local**, measured on the full seed-1 input, which was generated into `~/sd-data/a-full`. `requests.log` sha256 `7ec80ba45bceef51ac7f79d3a14521fc6187b2dcb87b5e5542d08063fe5d962a` matches the spec. The unchanged reference ran there once, at 0-11: **45,342 ms, 232,364 KiB**, with output sha256 `495ca096…` (the spec's full hash). Its output is kept, and every timed run below was compared with it; all matched.
+
+- **Timing:** sd-timer inside the container, `memory.peak` of the container cgroup, 11 runs per configuration unless noted, medians (min–max).
+- **S:** clang-format 23.1.3 (the PyPI wheel the board's tools image uses) with `--style=LLVM`, then scc-style counting of non-blank, non-comment lines. On this basis step 4 is **299** lines.
+- **Machine:** this laptop throttled for part of the session. Step 4 went from about 80 ms to about 140 ms at 0-11 and back to about 60 ms. Every comparison is therefore an A/B within one script run.
+
+- **Problem identified.** Step 4 at full scale, phase timers in a throwaway copy (3 runs each):
+
+  | Phase | 1 CPU | 0-7 | 0-11 |
+  |---|---|---|---|
+  | scan | 248–318 ms | 58–69 ms | 48–54 ms |
+  | endpoint qsort + open | 0.6 ms | 0.5–0.7 ms | 0.5–0.6 ms |
+  | hour phase | 133–146 ms | 24–33 ms | 24–31 ms |
+  | final flush + close | 0.0 ms | 0.0 ms | 0.0 ms |
+  | start + exit (sd-timer total minus in-process time) | 7–10 ms | 8 ms | 8–9 ms |
+
+  Baseline: 1 CPU 397 ms (351–471); 0-7 87 ms (71–129); 0-11 84 ms (73–95), 45.1 MB.
+
+  Latency sizes at full: 1 byte 0.218%, 2 bytes 85.162%, 3 bytes 14.571%, 4 bytes 0.048%; mean 2.144 bytes. So a 6-byte bucket record carries about 1.9 bytes it does not need.
+- **Optimization (kept, E2).** Each hour bucket is one byte stream of records: a u16 tag (endpoint id in bits 0–11, latency length − 1 in bits 12–13, 5xx in bit 15), then 1–4 little-endian latency bytes.
+  - **Append:** always writes 4 latency bytes and advances by 3 + length. The buffer grows whenever fewer than 6 bytes of room remain, so the 4-byte write and the later 4-byte read stay inside written memory.
+  - **Decode:** the hour phase reads 4 bytes and masks with `0xFFFFFFFF >> 8·(3 − length)`, and counts records while counting groups.
+
+  A record averages 4.14 bytes instead of 6.
+- **Not done:**
+  - **B2 (`-mtune`):** waits for confirmation of the board CPU's family.
+  - **B5 (`FROM scratch`):** the board's Dockerfile check requires every `FROM` to be an allowlisted image pinned by digest, or an earlier stage, so `scratch` would be refused.
+  - **A file without a final newline:** not tested. The spec says every line ends with LF, including the last.
+- **Tried on the way** (full scale, 0-11 unless noted; Δpoints = 25·log10(T_old/T_new) + 10·log10(M_old/M_new) + 7.5·log10(S_old/S_new)):
+
+  | Exp | Change | S | Measurements (step 4 → change), medians | Δpoints | Verdict |
+  |---|---|---|---|---|---|
+  | E1 | `madvise(MADV_DONTNEED)` each parsed chunk | 302 | 79 → 84 ms; 1 CPU 385 → 353; 0-7 88 → 79 | −0.70 | revert |
+  | E2 | variable-length latency records | 311 | five rounds: 81→86, 84→90, 81→83, 60→62, 54→57 ms (time ×1.049 mean, s.e. ≈ 0.009); peak 45.3→37.5, 45.7→38.0, 45.5→38.1, 44.1→35.9, 43.9→36.2 MB | ≈ +0.15 ± 0.1 | **keep** |
+  | E3 | one set of threads, barrier between the phases | 307 | 77 → 82 ms | −0.77 | revert |
+  | E4 | two digits per division in `num()` (table built at start) | 305 | 143 → 131 ms; 0-7 131 → 144; 1 CPU 635 → 597 (throttled session) | not beyond noise, −0.06 for lines | revert |
+  | E5 | insertion sort for groups ≤ 16 / 32 / 64 | about 309 | 133 → 142 / 129 / 136 ms (throttled); fast-state re-check, threshold 32: 60→78, 54→65 ms | < 0 | revert |
+  | E6a | SWAR latency digits (LF found with has-zero-byte, 8-digit combine) | 318 | 148→131, 145→147, 138→131, 60→50, 54→60 ms; 1 CPU 627→594, 691→697, 623→665 | not beyond noise, −0.20 for lines | revert |
+  | E6b | 32-byte AVX2 endpoint compare against zero-padded 128-byte slots | 304 | 148→138, 145→144, 138→133 ms; 1 CPU 627→597, 691→647, 623→630 | not beyond noise | revert |
+  | E6c | `_mm_crc32_u64` hash | 299 | 148 → 138 ms; 1 CPU 627 → 673 | not beyond noise | revert |
+  | B1 | `-O2`; `-O2 -funroll-loops`; `-O3 -funroll-loops` | 299 | 148 → 144 / 150 / 142 ms; 1 CPU 627 → 594 / 667 / 616 | noise | keep `-O3` |
+  | B3 | `-s -Wl,--gc-sections -ffunction-sections -fdata-sections` | 299 | binary 1,071,592 → 790,928 bytes; 148 → 144 ms; peak unchanged | 0 | not adopted |
+  | B4 | PGO (`-fprofile-generate -fprofile-update=atomic`, sample run, `-fprofile-use`) | 299 + profile | 66→72, 58→55 ms; 1 CPU 318→312, 322→349 | 0 | not worth a committed `.gcda` |
+
+  The first PGO attempt was invalid: the profile was named after the generating binary (`gen-main.gcda`), so `-fprofile-use` for `-o ingest` found none (`-Wmissing-profile`). It was redone with the same output name, and checked with `-Werror=missing-profile`.
+- **Result** (A/B in one session, 11 runs each, full scale, local):
+
+  | CPUs | step 4 | step 5 |
+  |---|---|---|
+  | 1 | 300 ms (271–354), 31,200 KiB | 313 ms (255–360), 24,952 KiB |
+  | 0-7 | 65 ms (57–81), 40,196 KiB | 71 ms (62–98), 33,004 KiB |
+  | 0-11 | 60 ms (43–98), 44,248 KiB | 57 ms (52–66), 36,016 KiB |
+
+  S: 299 → 311. The 0-11 time difference is within noise; across five rounds E2 costs about 5% of time and saves 17–18% of peak memory.
+- **Correctness:** the gate ran on the final source with the ASan/UBSan build with `-Wall -Wextra`, on 1, 8 and 12 CPUs each, with no sanitizer reports and no warnings. Every dataset matched:
+  - the worked example, byte for byte;
+  - an empty `requests.log`, giving an empty `summary.txt`;
+  - tiny seeds 1–3 and sample seeds 1–3 (sample seed 1 is `ca6311bb…`);
+  - a latency-edge file (4,000 lines whose latencies are 0, 1, 254, 255, 256, 257, 65534, 65535, 65536, 65537, 16777215, 16777216, 4294967294 and 4294967295, plus random values, mixed in each group), against its reference output;
+  - the full-scale input, against the reference's output.
+
+  That is 30 runs and 0 failures. Every gated experiment (E1–E6) also passed this gate before it was timed.
 
 ## Step 4: one pass, no merge, per-hour parallel finish
 
