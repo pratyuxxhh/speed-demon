@@ -15,6 +15,7 @@
 // has no out-edges, is answered -1 without searching.
 #define _GNU_SOURCE
 #include <fcntl.h>
+#include <immintrin.h>
 #include <malloc.h>
 #include <pthread.h>
 #include <sched.h>
@@ -68,10 +69,9 @@ static void die(const char *m) {
   exit(1);
 }
 
-// Pass 3: edge u -> v of weight w, in the new numbering, at u's next cursor;
-// its head gains an in-edge.
-static void put(Th *t, uint32_t u, uint32_t v, uint32_t w) {
-  uint32_t k = __atomic_fetch_add(&cur[u], 1, __ATOMIC_RELAXED);
+// Pass 3: edge u -> v of weight w, in the new numbering, at index k; its head
+// gains an in-edge.
+static void put(Th *t, uint32_t k, uint32_t u, uint32_t v, uint32_t w) {
   int64_t dv = (int64_t)v - u;
   __atomic_store_n(&has_in[v], 1, __ATOMIC_RELAXED);
   if (dv >= INT16_MIN && dv <= INT16_MAX && w < ESC) {
@@ -84,27 +84,52 @@ static void put(Th *t, uint32_t u, uint32_t v, uint32_t w) {
   pk[k] = ESC;
 }
 
+// The value of the 1 to 8 digits at s: shifted to the top of a word, then
+// pairs, quads and octets combined (reads 8 bytes from s).
+static uint64_t num(const char *s, long k) {
+  uint64_t x;
+  memcpy(&x, s, 8);
+  x = x << (64 - 8 * k) & 0x0F0F0F0F0F0F0F0Full;
+  x = (x * 10 + (x >> 8)) & 0x00FF00FF00FF00FFull;
+  x = (x * 100 + (x >> 16)) & 0x0000FFFF0000FFFFull;
+  return (x * 10000 + (x >> 32)) & 0xFFFFFFFF;
+}
+
 // This thread's lines: pass 1 counts each tail's out-edges; pass 2 stores their
 // heads; pass 3, once the nodes are renumbered, stores the edges packed. Lines
 // are parsed 32 at a time and the node entries they will touch prefetched
-// first, so the cache misses of the shuffled ids overlap (pass 3 does it again
-// after renumbering).
+// first, so the cache misses of the shuffled ids overlap; passes 2 and 3 then
+// take all 32 cursors and prefetch the edge slots before writing them (and
+// pass 3 maps the ids through the renumbering, prefetched too).
 static void *scan(void *arg) {
   Th *t = arg;
   const char *p = t->beg;
-  uint32_t a[3][32], m = 0;
+  uint32_t a[4][32], m = 0;
   if (pass == 1) // the pages in one call, not a fault each
     madvise((void *)((uintptr_t)p & ~4095ul), t->end - p + 4096, 22); // POPULATE_READ
   while (p < t->end) {
+    // The line's spaces and LF from one 32-byte compare, then each number eight
+    // digits at once; a line too long for that is read digit by digit.
+    __m256i x = _mm256_loadu_si256((const __m256i *)p);
+    uint32_t sp = _mm256_movemask_epi8(_mm256_or_si256(
+        _mm256_cmpeq_epi8(x, _mm256_set1_epi8(' ')), _mm256_cmpeq_epi8(x, _mm256_set1_epi8('\n'))));
+    uint32_t i1 = _tzcnt_u32(sp), i2 = _tzcnt_u32(_blsr_u32(sp)), i3 = _tzcnt_u32(_blsr_u32(_blsr_u32(sp)));
     uint32_t u = 0, v = 0;
     uint64_t w = 0;
-    for (; *p != ' '; p++)
-      u = u * 10 + (*p - '0');
-    for (p++; *p != ' '; p++)
-      v = v * 10 + (*p - '0');
-    for (p++; *p != '\n'; p++)
-      w = w * 10 + (*p - '0');
-    p++;
+    if (i3 < 32 && i1 <= 8 && i2 - i1 <= 9) {
+      u = num(p, i1), v = num(p + i1 + 1, i2 - i1 - 1);
+      w = i3 - i2 > 9 ? num(p + i2 + 1, i3 - i2 - 9) * 100000000 + num(p + i3 - 8, 8)
+                      : num(p + i2 + 1, i3 - i2 - 1);
+      p += i3 + 1;
+    } else {
+      for (; *p != ' '; p++)
+        u = u * 10 + (*p - '0');
+      for (p++; *p != ' '; p++)
+        v = v * 10 + (*p - '0');
+      for (p++; *p != '\n'; p++)
+        w = w * 10 + (*p - '0');
+      p++;
+    }
     if (u != v && u < n && v < n) { // a self-loop never shortens a path
       a[0][m] = u, a[1][m] = v, a[2][m++] = w;
       __builtin_prefetch(pass == 1 ? &off[u + 1] : pass == 2 ? &cur[u] : &perm[u], 1);
@@ -117,13 +142,17 @@ static void *scan(void *arg) {
       a[0][i] = perm[a[0][i]], a[1][i] = perm[a[1][i]];
       __builtin_prefetch(&cur[a[0][i]], 1), __builtin_prefetch(&has_in[a[1][i]], 1);
     }
+    for (uint32_t i = 0; pass > 1 && i < m; i++) {
+      a[3][i] = __atomic_fetch_add(&cur[a[0][i]], 1, __ATOMIC_RELAXED);
+      __builtin_prefetch(pass == 2 ? &adj[a[3][i]] : &pk[a[3][i]], 1);
+    }
     for (uint32_t i = 0; i < m; i++)
       if (pass == 1)
         __atomic_fetch_add(&off[a[0][i] + 1], 1, __ATOMIC_RELAXED);
       else if (pass == 2)
-        adj[__atomic_fetch_add(&cur[a[0][i]], 1, __ATOMIC_RELAXED)] = a[1][i];
+        adj[a[3][i]] = a[1][i];
       else
-        put(t, a[0][i], a[1][i], a[2][i]);
+        put(t, a[3][i], a[0][i], a[1][i], a[2][i]);
     m = 0;
   }
   return NULL;
@@ -184,6 +213,10 @@ static int64_t dial(Th *t, uint32_t s, uint32_t tg) {
     Bucket *b = &t->ring[d & (RING - 1)];
     for (uint32_t k = 0; k < b->n && res == -1; k++) { // weight-0 edges add to this bucket
       uint32_t u = b->v[k];
+      if (k + 4 < b->n)
+        __builtin_prefetch(&off[b->v[k + 4]]);
+      if (k + 2 < b->n)
+        __builtin_prefetch(&pk[off[b->v[k + 2]]]);
       inring--;
       if (!settle(t, u))
         continue; // already settled, at a shorter distance
@@ -298,7 +331,10 @@ int main(void) {
   // graph.txt: "n m" then "u v w" lines, each thread a line-aligned share.
   struct stat st;
   int fd = open("/data/graph.txt", O_RDONLY);
-  const char *g = fd < 0 || fstat(fd, &st) ? MAP_FAILED : mmap(NULL, st.st_size + 1, PROT_READ, MAP_PRIVATE, fd, 0);
+  char *z = fd < 0 || fstat(fd, &st) ? MAP_FAILED // over zeros a page longer, so
+          : mmap(NULL, st.st_size + 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0); // the
+  const char *g = z == MAP_FAILED ? z // 32-byte loads past the last line stay mapped
+                  : mmap(z, st.st_size, PROT_READ, MAP_PRIVATE | MAP_FIXED, fd, 0);
   if (g == MAP_FAILED || !(n = strtoul(g, NULL, 10)))
     die("cannot read /data/graph.txt");
   const char *end = g + st.st_size, *body = (const char *)memchr(g, '\n', st.st_size) + 1;
