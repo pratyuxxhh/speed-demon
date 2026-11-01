@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -64,15 +65,27 @@ static void die(const char *m) {
   exit(1);
 }
 
-static uint64_t hash_bytes(const char *s, uint32_t n) { // reads up to 7 bytes past s + n
-  uint64_t h = n * 0x9E3779B97F4A7C15ull, w;
-  for (uint32_t i = 0; i < n; i += 8) {
-    memcpy(&w, s + i, 8);
-    if (n - i < 8)
-      w &= (1ull << (8 * (n - i))) - 1;
-    h = (h ^ w) * 0xFF51AFD7ED558CCDull;
-  }
-  return h | 1ull << 63; // never 0 (empty) or 1 (being written)
+// The hash of endpoint s[0..n), with no loop to mispredict on its length: a CRC
+// of its first 16 bytes (zero padded), its last 8 when it is longer, and n
+// (reads 16 bytes from s). Never 0 (empty) or 1 (being written).
+static uint64_t hash_bytes(const char *s, uint32_t n) {
+  uint64_t a, b, c;
+  memcpy(&a, s, 8), memcpy(&b, s + 8, 8), memcpy(&c, s + (n > 16 ? n - 8 : 0), 8);
+  a &= n >= 8 ? ~0ull : (1ull << 8 * n) - 1;
+  b &= n >= 16 ? ~0ull : n <= 8 ? 0 : (1ull << 8 * (n - 8)) - 1;
+  c &= -(uint64_t)(n > 16);
+  return _mm_crc32_u64(_mm_crc32_u64(_mm_crc32_u64(n, a), b), c) * 0x9E3779B97F4A7C15ull | 1ull << 63;
+}
+
+// The value of the 1 to 8 digits at s: shifted to the top of a word, then
+// pairs, quads and octets combined (reads 8 bytes from s).
+static uint64_t digits(const char *s, uint32_t k) {
+  uint64_t x;
+  memcpy(&x, s, 8);
+  x = x << (64 - 8 * k) & 0x0F0F0F0F0F0F0F0Full;
+  x = (x * 10 + (x >> 8)) & 0x00FF00FF00FF00FFull;
+  x = (x * 100 + (x >> 16)) & 0x0000FFFF0000FFFFull;
+  return (x * 10000 + (x >> 32)) & 0xFFFFFFFF;
 }
 
 // The id of endpoint s[0..n), inserted when new: an inserter claims an empty
@@ -129,11 +142,11 @@ static void parse(Th *t, const char *p, const char *hi) {
                      : m1 == 'U' ? 3
                      : m1 == 'O' ? 4
                                  : 5); // PUT, POST, PATCH
-    const char *e = next_space(s);
-    uint32_t lat = 0;
-    for (p = e + 5; *p != '\n'; p++)
-      lat = lat * 10 + (*p - '0');
-    p++;
+    const char *e = next_space(s), *l = e + 5; // the latency: up to 10 digits, then LF
+    uint32_t k = __builtin_ctz(_mm_movemask_epi8(
+        _mm_cmpeq_epi8(_mm_loadu_si128((const __m128i *)l), _mm_set1_epi8('\n'))));
+    uint32_t lat = k > 8 ? digits(l, k - 8) * 100000000 + digits(l + k - 8, 8) : digits(l, k);
+    p = l + k + 1;
     uint32_t len = lat < 1u << 8 ? 0 : lat < 1u << 16 ? 1 : lat < 1u << 24 ? 2 : 3; // bytes - 1
     uint16_t tag = ep_id(s, e - s) | len << 12 | (e[1] == '5' ? ERRBIT : 0);
     Bucket *b = &t->b[hr];
@@ -160,30 +173,42 @@ static void *scan(void *arg) {
   return NULL;
 }
 
-// The k-th smallest of a[0..n), leaving a[0..k) <= a[k] <= a[k+1..n).
+static void swap(uint32_t *a, long i, long j) {
+  uint32_t x = a[i];
+  a[i] = a[j], a[j] = x;
+}
+
+// The k-th smallest of a[0..n), leaving a[0..k) <= a[k] <= a[k+1..n). Each
+// partition is branch-free (every element is swapped, and the boundary moves
+// by the comparison), since latencies are random and branches would miss half
+// the time. When nothing is below the pivot, its equals are gathered next to
+// it, so runs of one value cannot make the search quadratic.
 static uint32_t select_k(uint32_t *a, long n, long k) {
-  long lo = 0, hi = n - 1;
-  while (lo < hi) {
-    uint32_t x = a[lo], y = a[(lo + hi) / 2], z = a[hi];
-    uint32_t piv = x < y ? (y < z ? y : (x < z ? z : x)) : (x < z ? x : (y < z ? z : y));
-    long i = lo, j = hi;
-    while (i <= j) {
-      while (a[i] < piv)
-        i++;
-      while (a[j] > piv)
-        j--;
-      if (i <= j) {
-        uint32_t tmp = a[i];
-        a[i++] = a[j];
-        a[j--] = tmp;
-      }
-    }
-    if (k <= j)
-      hi = j;
-    else if (k >= i)
+  for (long lo = 0, hi = n - 1, i, j; lo < hi;) {
+    long mid = lo + (hi - lo) / 2; // the median of three goes to a[hi]
+    if (a[mid] < a[lo])
+      swap(a, mid, lo);
+    if (a[hi] < a[lo])
+      swap(a, hi, lo);
+    if (a[mid] < a[hi])
+      swap(a, mid, hi);
+    uint32_t piv = a[hi], x;
+    for (i = lo, j = lo; j < hi; j++)
+      x = a[j], a[j] = a[i], a[i] = x, i += x < piv;
+    a[hi] = a[i], a[i] = piv;
+    if (k == i)
+      return piv;
+    if (k < i)
+      hi = i - 1;
+    else if (i > lo)
+      lo = i + 1;
+    else { // a[lo] is the least: [lo, i) becomes the run of values equal to it
+      for (i = j = lo + 1; j <= hi; j++)
+        x = a[j], a[j] = a[i], a[i] = x, i += x == piv;
+      if (k < i)
+        return piv;
       lo = i;
-    else
-      break;
+    }
   }
   return a[k];
 }
@@ -247,6 +272,7 @@ static void *hours(void *arg) {
         t->lats[t->pos[tag & (CAP - 1)]++] = lat & 0xFFFFFFFFu >> (8 * (3 - (tag >> 12 & 3)));
         k += 3 + (tag >> 12 & 3);
       }
+      free(b->buf); // the hour's records are no longer needed
     }
     if (!t->out) { // a line is at most 21 + 125 + 57 + 1 = 204 bytes
       pthread_mutex_lock(&smu);
@@ -303,6 +329,7 @@ static int cmp_ep(const void *x, const void *y) {
 }
 
 int main(void) {
+  prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0); // 2 MB pages would be charged whole
   struct stat st;
   int fd = open("/data/requests.log", O_RDONLY);
   if (fd < 0 || fstat(fd, &st))
